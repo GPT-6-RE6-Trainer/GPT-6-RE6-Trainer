@@ -26,4 +26,3 @@ CT 脚本灵感来自 [Heebo](https://www.patreon.com/Heebo)，感谢其提供�
 
 </details>
 
-Tags: `RE6` · `修改器` · `Trainers` · `辅助`
