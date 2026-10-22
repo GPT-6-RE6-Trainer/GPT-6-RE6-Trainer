@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "repository_configured": true,
+  "release_url": "https://github.com/GPT-6-RE6-Trainer/GPT-6-RE6-Trainer/releases",
+  "files": [
+    {
+      "name": "GPT-6 RE6 Cheat Board.py",
+      "version": 1,
+      "size": 13089907,
+      "sha256": "a90b61635960096967edf28676af25bedfa4e613d9d9d8a08d86402218e5557a",
+      "placeholder": false,
+      "url": "https://raw.githubusercontent.com/GPT-6-RE6-Trainer/GPT-6-RE6-Trainer/main/GPT-6%20RE6%20Cheat%20Board.py"
+    },
+    {
+      "name": "RE6 NO Game over + No Blur .CT",
+      "version": 1,
+      "size": 134494,
+      "sha256": "7f93021851cac4901927b550f15fc392ad98ff9acb79e9f4b1e9b8ecd4e87fc0",
+      "placeholder": false,
+      "url": "https://raw.githubusercontent.com/GPT-6-RE6-Trainer/GPT-6-RE6-Trainer/main/RE6%20NO%20Game%20over%20%2B%20No%20Blur%20.CT"
+    }
+  ]
+}

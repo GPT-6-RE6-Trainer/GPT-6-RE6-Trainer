@@ -1,0 +1,2491 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CheatTable CheatEngineTableVersion="52">
+  <CheatEntries>
+    <CheatEntry>
+      <ID>21911</ID>
+      <Description>"GPT-6 No Low Health Screen Filter"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>{$lua}
+if syntaxcheck then return end
+local lifecycle=(function()
+-- Shared by the three standalone tables; bootstrapped by each entry.
+local previous=_G.RE6TableLifecycle20260915
+if previous and previous.revision==5 then return previous end
+local M=previous or {states={},serial=0}
+if M.timer then M.timer.Enabled=false;M.timer.destroy() end
+M.revision=5
+local function api(name,...)
+  local args={...}
+  for i,v in ipairs(args) do args[i]={type=0,value=v} end
+  return executeCodeLocalEx(getAddress(name,true),table.unpack(args))
+end
+local function must(v,name) assert(v and v~=0,name..' failed');return v end
+local function bytes(hex)
+  local out={};for v in hex:gmatch('%x%x') do out[#out+1]=tonumber(v,16) end;return out
+end
+local function equal(a,b)
+  if not a or #a~=#b then return false end
+  for i,v in ipairs(b) do if a[i]~=v then return false end end;return true
+end
+local function u32(t,i)
+  i=(i or 0)+1;return t[i]|t[i+1]&lt;&lt;8|t[i+2]&lt;&lt;16|t[i+3]&lt;&lt;24
+end
+local function packed(v)
+  return {v&amp;255,(v&gt;&gt;8)&amp;255,(v&gt;&gt;16)&amp;255,(v&gt;&gt;24)&amp;255}
+end
+local function join(...)
+  local out={};for _,a in ipairs({...}) do for _,b in ipairs(a) do out[#out+1]=b end end;return out
+end
+function M.alive(s)
+  if not s.handle then return false end
+  local wait=api('kernel32.WaitForSingleObject',s.handle,0)
+  assert(wait==0 or wait==258,'Cannot query the original game lifetime');return wait==258
+end
+function M.current(s)
+  return M.alive(s) and s.pid==getOpenedProcessID() and getAddressSafe('BH6.exe')==s.base
+end
+local function read(s,address,n)
+  must(api('kernel32.ReadProcessMemory',s.handle,address,s.buffer.Memory,n,s.scratch.Memory),'ReadProcessMemory')
+  assert(readQwordLocal(s.scratch.Memory)==n,'Partial memory read')
+  s.buffer.Position=0;return s.buffer.read(n)
+end
+local function write(s,address,data)
+  s.buffer.Position=0;s.buffer.write(data)
+  must(api('kernel32.WriteProcessMemory',s.handle,address,s.buffer.Memory,#data,s.scratch.Memory),'WriteProcessMemory')
+  assert(readQwordLocal(s.scratch.Memory)==#data and equal(read(s,address,#data),data),'Patch readback mismatch')
+  must(api('kernel32.FlushInstructionCache',s.handle,address,#data),'FlushInstructionCache')
+end
+local function protect(s,address,n,value)
+  must(api('kernel32.VirtualProtectEx',s.handle,address,n,value,s.scratch.Memory),'VirtualProtectEx')
+  return readIntegerLocal(s.scratch.Memory)
+end
+local function busy(s,changes)
+  local snap=api('kernel32.CreateToolhelp32Snapshot',4,0)
+  assert(snap and snap~=0 and snap~=-1,'Thread snapshot failed')
+  local result=false
+  local ok,err=pcall(function()
+    local p=s.scratch.Memory+0x100;writeIntegerLocal(p,28)
+    local more=must(api('kernel32.Thread32First',snap,p),'Thread32First')
+    local count=0
+    while more~=0 do
+      if readIntegerLocal(p+12)==s.pid then
+        local h=must(api('kernel32.OpenThread',0x48,0,readIntegerLocal(p+8)),'OpenThread')
+        local ctx=s.scratch.Memory+0x200;writeIntegerLocal(ctx,0x10001)
+        local got=api('kernel32.Wow64GetThreadContext',h,ctx)
+        local ip=readIntegerLocal(ctx+184);api('kernel32.CloseHandle',h)
+        must(got,'Wow64GetThreadContext');count=count+1
+        for _,v in ipairs(changes) do if ip&gt;=v.address and ip&lt;v.address+#v.old then result=true end end
+      end
+      writeIntegerLocal(p,28);more=api('kernel32.Thread32Next',snap,p)
+    end
+    assert(count&gt;0,'No game threads found')
+  end)
+  api('kernel32.CloseHandle',snap);assert(ok,err);return result
+end
+-- Only entry-point writes require a short, verified transaction. Caves are retained.
+function M.change(s,changes)
+  if #changes==0 then return end
+  assert(M.alive(s),'The original game process exited')
+  for attempt=1,30 do
+    local status=api('ntdll.NtSuspendProcess',s.handle)
+    assert(status and (status&amp;0x80000000)==0,'NtSuspendProcess failed')
+    s.suspended=true
+    local retry=false;local attempted={};local protections={}
+    local ok,err=xpcall(function()
+      retry=busy(s,changes);if retry then return end
+      for _,v in ipairs(changes) do assert(equal(read(s,v.address,#v.old),v.old),'Patch changed during recovery') end
+      for _,v in ipairs(changes) do
+        protections[#protections+1]={v.address,#v.old,protect(s,v.address,#v.old,0x40)}
+        attempted[#attempted+1]=v;write(s,v.address,v.new)
+      end
+    end,debug.traceback)
+    if not ok then
+      for i=#attempted,1,-1 do
+        local v=attempted[i]
+        if not pcall(write,s,v.address,v.old) then s.critical=true end
+      end
+    end
+    for i=#protections,1,-1 do
+      local p=protections[i];local restored,why=pcall(protect,s,p[1],p[2],p[3])
+      if not restored then ok=false;err=tostring(err)..'\n'..tostring(why) end
+    end
+    if s.critical then error('Patch rollback failed; controller retained for recovery') end
+    local resumed=api('ntdll.NtResumeProcess',s.handle)
+    assert(resumed and (resumed&amp;0x80000000)==0,'NtResumeProcess failed; controller retained')
+    s.suspended=false
+    assert(ok,err)
+    if not retry then return end
+    sleep(5)
+  end
+  error('Game thread is inside the patch; retry enabling this entry')
+end
+local function jump(s,address,opcode)
+  local t=read(s,address,5);assert(t[1]==opcode,'Unknown hook opcode')
+  return (address+5+u32(t,1))&amp;0xffffffff
+end
+local function checkKeepBlood(s,site,code)
+  local function expect(p,hex)
+    local b=bytes(hex);assert(equal(read(s,p,#b),b),'Unknown Game Over hook');return p+#b
+  end
+  local function branch(p,short,near)
+    local b=read(s,p,6)
+    if b[1]==short then return p+2+((b[2]&gt;=128) and b[2]-256 or b[2]),p+2 end
+    assert(b[1]==0x0f and b[2]==near,'Unknown Game Over condition')
+    return (p+6+u32(b,2))&amp;0xffffffff,p+6
+  end
+  local function jmp(p)
+    local b=read(s,p,5)
+    if b[1]==0xeb then return p+2+((b[2]&gt;=128) and b[2]-256 or b[2]) end
+    return jump(s,p,0xe9)
+  end
+  local p=expect(code,'83 F9 01');local skip
+  skip,p=branch(p,0x75,0x85)
+  assert(equal(read(s,p,6),join(bytes('81 3E'),packed(s.base+0x1190f40))),'Unknown Game Over type gate');p=p+6
+  local skip2;skip2,p=branch(p,0x74,0x84);assert(skip2==skip,'Unknown Game Over target')
+  p=expect(p,'8B 16 83 E0 FA')
+  local ret=jmp(p)
+  assert(jmp(skip)==site+0x59 and jmp(ret)==site+7,'Unknown Game Over return')
+end
+function M.recover(s,spec)
+  local changes={}
+  for _,v in ipairs(spec or {}) do
+    local address=s.base+v.rva;local original=bytes(v.original)
+    local current=read(s,address,#original)
+    if v.context then assert(equal(read(s,address+#original,#bytes(v.context)),bytes(v.context)),'Unsupported patch context') end
+    if not equal(current,original) then
+      if v.kind=='camera' then
+        local code=jump(s,address,0xe9)
+        assert(equal(read(s,code,14),join(bytes('89 0D'),packed(code-4),original))
+          and jump(s,code+14,0xe9)==address+8,'Unknown camera hook; no takeover attempted')
+        local padding={current[6],current[7],current[8]}
+        assert(equal(padding,{0x90,0x90,0x90}) or equal(padding,{0x0f,0x1f,0x00}),'Unknown camera padding')
+      elseif v.kind=='input' then
+        local code=jump(s,address,0xe9)
+        assert(equal(read(s,code-6,6),original) and equal(read(s,code,27),
+          join(bytes('83 A6 AC 02 00 00 00 83 A6 B0 02 00 00 00 83 A6 B4 02 00 00 00'),original))
+          and jump(s,code+27,0xe9)==address+6 and current[6]==0x90,'Unknown controller input hook')
+      elseif v.kind=='blood' then
+        assert(current[6]==0x90 and current[7]==0x90,'Unknown Game Over patch')
+        checkKeepBlood(s,address,jump(s,address,0xe9))
+      else assert(equal(current,bytes(v.patched)),'Foreign patch detected; memory was left unchanged') end
+      changes[#changes+1]={address=address,old=current,new=original}
+    end
+  end
+  -- Validate every site before restoring any of them.
+  M.change(s,changes)
+end
+local function localStop(s)
+  for _,name in ipairs(s.meta.timers or {}) do
+    local t=_G[name];if t then t.Enabled=false;t.destroy();_G[name]=nil end
+  end
+  if s.key=='21848' then _G.fc_loop_running=false end
+  for name,address in pairs(s.symbols or {}) do
+    if getAddressSafe(name)==address then unregisterSymbol(name) end
+  end
+end
+function M.stop(s)
+  if not s or s.closed then return end
+  local running=M.alive(s)
+  if not running then s.critical=false;s.suspended=false end
+  assert(not s.critical and not s.suspended,'Unresolved patch transaction; controller retained')
+  if s.key=='1545' or s.key=='241' or s.key=='21848' then
+    for _,key in ipairs({'21848','21913','21912','241'}) do
+      if key~=s.key and (key~='241' or s.key=='1545') and M.states[key] then M.stop(M.states[key]) end
+    end
+  end
+  -- An old CE may have left companion hooks that are not checked in this new table.
+  if running and s.meta.release then M.recover(s,s.meta.release) end
+  if s.enabled and running and #(s.meta.sites or {})&gt;0 then
+    local changes={}
+    for i,v in ipairs(s.meta.sites) do
+      local address=s.base+v.rva;local original=bytes(v.original)
+      local current=read(s,address,#original)
+      if not equal(current,original) then
+        assert(s.installed[i] and equal(current,s.installed[i].data),
+          'The active patch was changed by another controller; refusing to overwrite it')
+        changes[#changes+1]={address=address,old=current,new=original}
+      end
+    end
+    -- Restore through the original handle even if CE is now viewing another process.
+    M.change(s,changes)
+    localStop(s)
+    if s.key=='9002' then extra_respawn_patch_site=nil end
+  elseif s.enabled and (M.current(s) or s.meta.ownedHandle) then
+    local ok,err=autoAssemble(s.script,s.disableInfo)
+    assert(ok,'Disable failed: '..tostring(err))
+  else localStop(s) end
+  if running then
+    for _,v in ipairs(s.meta.restore or s.meta.sites or {}) do
+      local original=bytes(v.original)
+      assert(equal(read(s,s.base+v.rva,#original),original),
+        string.format('Original bytes were NOT restored at BH6.exe+%X / 原始指令尚未恢复',v.rva))
+    end
+    for _,v in ipairs(s.meta.release or {}) do
+      local original=bytes(v.original)
+      assert(equal(read(s,s.base+v.rva,#original),original),'A companion camera patch was not restored')
+    end
+  end
+  s.enabled=false
+  if s.record then pcall(function()
+    local function reset(record,children)
+      if children then for i=record.Count-1,0,-1 do reset(record.Child[i],true) end end
+      record.disableWithoutExecute()
+    end
+    reset(s.record,s.key=='1545' or s.key=='241')
+  end) end
+  if s.lock then
+    if s.ownsLock then api('kernel32.ReleaseMutex',s.lock) end
+    api('kernel32.CloseHandle',s.lock)
+  end
+  if s.handle then api('kernel32.CloseHandle',s.handle) end
+  if s.buffer then s.buffer.destroy() end
+  if s.scratch then s.scratch.destroy() end
+  s.handle=nil;s.closed=true
+  if M.states[s.key]==s then M.states[s.key]=nil end
+end
+function M.enable(key,record,script,meta)
+  local old=M.states[key]
+  if old then
+    if M.current(old) and old.enabled then error('This feature is already active in this CE session / 此功能已在当前 CE 中启用') end
+    M.stop(old)
+  end
+  local s={key=key,record=record,script=script,meta=meta or {}}
+  M.serial=M.serial+1;s.serial=M.serial;M.states[key]=s
+  local ok,err=xpcall(function()
+    s.pid=getOpenedProcessID();s.base=getAddressSafe('BH6.exe')
+    assert(s.pid and s.pid&gt;0 and s.base,'Attach BH6.exe first / 请先连接 BH6.exe')
+    s.handle=must(api('kernel32.OpenProcess',0x100c38,0,s.pid),'OpenProcess')
+    s.buffer=createMemoryStream();s.buffer.Size=0x2000
+    s.scratch=createMemoryStream();s.scratch.Size=0x1000
+    local header=read(s,s.base,0x1000);local pe=u32(header,0x3c)
+    assert(pe&gt;=64 and pe+0x54&lt;#header and u32(header,pe)==0x4550 and u32(header,pe+8)==0x51960399
+      and u32(header,pe+0x50)==0x14a1000,'Unsupported BH6.exe build')
+    local p=s.scratch.Memory
+    must(api('kernel32.GetProcessTimes',s.handle,p,p+8,p+16,p+24),'GetProcessTimes')
+    local lockKey=(key=='21915' or key=='21919') and 'game_over' or key
+    for _,other in pairs(M.states) do
+      assert(other==s or other.lockKey~=lockKey or not M.alive(other),
+        'An overlapping option is already active / 修改同一地址的另一个选项已启用')
+    end
+    s.lockKey=lockKey
+    local name=string.format('Local\\RE6_CT_%s_%d_%08X%08X',lockKey,s.pid,readIntegerLocal(p+4),readIntegerLocal(p))
+    s.lock=must(executeCodeLocalEx(getAddress('kernel32.CreateMutexW',true),
+      {type=0,value=0},{type=0,value=0},{type=4,value=name}),'CreateMutexW')
+    local acquired=api('kernel32.WaitForSingleObject',s.lock,0)
+    assert(acquired==0 or acquired==0x80,'Another CE owns this feature / 另一份 CE 正在控制此功能')
+    s.ownsLock=true
+    M.recover(s,s.meta.sites)
+    -- Only this entry's old names can survive a CE process retarget.
+    for _,name in ipairs(s.meta.symbols or {}) do unregisterSymbol(name) end
+    for _,name in ipairs(s.meta.staleSymbols or {}) do unregisterSymbol(name) end
+    if key=='1545' or key=='21848' then _G.fc_loop_running=false end
+    local assembled,info=autoAssemble(script)
+    assert(assembled,tostring(info));s.disableInfo=info;s.enabled=true
+    s.installed={}
+    for _,v in ipairs(s.meta.sites or {}) do
+      local address=s.base+v.rva
+      s.installed[#s.installed+1]={address=address,data=read(s,address,#bytes(v.original))}
+    end
+    s.symbols={}
+    for _,name in ipairs(s.meta.symbols or {}) do s.symbols[name]=getAddressSafe(name) end
+  end,debug.traceback)
+  if not ok then
+    if not s.critical and not s.suspended then pcall(M.stop,s) end
+    error(err)
+  end
+end
+function M.disable(key,meta)
+  local s=M.states[key]
+  if s and meta then s.meta=meta end
+  M.stop(s)
+end
+function M.stopAll()
+  local list={};for _,s in pairs(M.states) do list[#list+1]=s end
+  table.sort(list,function(a,b)return a.serial&gt;b.serial end)
+  local errors={}
+  for _,s in ipairs(list) do local ok,why=pcall(M.stop,s);if not ok then errors[#errors+1]=tostring(why) end end
+  return #errors==0,table.concat(errors,'\n')
+end
+M.timer=createTimer(nil,false);M.timer.Interval=250
+M.timer.OnTimer=function()
+  local stale={}
+  for _,s in pairs(M.states) do
+    local ok,current=pcall(M.current,s)
+    if (s.enabled or s.suspended or s.critical) and ok and not current then stale[#stale+1]=s end
+  end
+  table.sort(stale,function(a,b)return a.serial&gt;b.serial end)
+  for _,s in ipairs(stale) do
+    local ok,err=pcall(M.stop,s)
+    if not ok and not s.reported then s.reported=true;print('[RE6 lifecycle] '..tostring(err)) end
+  end
+end
+M.timer.Enabled=true
+local form=getMainForm();local previous=form.OnCloseQuery
+form.OnCloseQuery=function(sender)
+  if previous and previous(sender)==false then return false end
+  local ok,err=M.stopAll()
+  if not ok then showMessage('Unable to restore one of this table\'s patches / 有补丁未能恢复：\n'..err);return false end
+  return true
+end
+_G.RE6TableLifecycle20260915=M
+return M
+end)()
+{$asm}
+[ENABLE]
+{$lua}
+if syntaxcheck then return end
+-- Independent native-output implementation, 2026-10-22.
+-- The owning controller loads data\id\cockpit\dying_00.
+-- Keep its state, events and internal clock. Send sample zero to its renderer
+-- at every output site, including entry/reset paths. No allocation or polling.
+-- FLDZ/FSTP replaces an SSE store without changing general/SSE registers or
+-- integer flags; FLDZ/NOP replaces an existing FLD. x87 depth stays balanced.
+local lifecycle=_G.RE6TableLifecycle20260915
+local meta={sites={
+  {rva=0x581323, original='f30f114244', patched='d9eed95a44', context='a168647c01d98020010000'},
+  {rva=0x5813F5, original='d94648', patched='d9ee90', context='0f57c9d95944f30f10464c'},
+  {rva=0x58156C, original='f30f114044', patched='d9eed95844', context='fe4638e987010000'},
+  {rva=0x5815A3, original='d94648', patched='d9ee90', context='d95a448b4e40e82fe50c00'},
+  {rva=0x5816F7, original='f30f114044', patched='d9eed95844', context='c64638008b0df8418601'}
+},symbols={}}
+-- Split section names so the outer AA parser cannot consume nested sections.
+-- These assertions also refuse the former accumulator patch or another owner.
+local source=table.concat({
+  '['..'ENABLE'..']',
+  'assert("BH6.exe"+5813D6,F3 0F 58 46 48 F3 0F 10 0D 14 C9 50 01)',
+  'assert("BH6.exe"+581584,F3 0F 58 46 48 F3 0F 10 0D 60 ED 54 01)',
+  '['..'DISABLE'..']'
+},'\n')
+lifecycle.enable('21911',memrec or getAddressList().getMemoryRecordByID(21911),source,meta)
+local state=lifecycle.states['21911']
+local function decode(hex)
+  local result={}
+  for byte in hex:gmatch('%x%x') do result[#result+1]=tonumber(byte,16) end
+  return result
+end
+local ok,why=xpcall(function()
+  local changes={}
+  for i,site in ipairs(meta.sites) do
+    local patch=decode(site.patched)
+    state.installed[i].data=patch
+    changes[#changes+1]={address=state.base+site.rva,old=decode(site.original),new=patch}
+  end
+  -- The existing lifecycle suspends briefly, checks thread IPs and all sites,
+  -- writes/readbacks/flushes together, and rolls back before resuming on error.
+  lifecycle.change(state,changes)
+end,debug.traceback)
+if not ok then
+  if not state.critical and not state.suspended then
+    local restored,restoreError=pcall(lifecycle.stop,state)
+    if not restored then error(tostring(why)..'\n'..tostring(restoreError)) end
+  end
+  error(why)
+end
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+local lifecycle=_G.RE6TableLifecycle20260915
+-- Use the active state's metadata, also when disabling an older loaded table.
+if lifecycle then lifecycle.disable('21911') end
+{$asm}
+</AssemblerScript>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>21916</ID>
+      <Description>"GPT-6 Dead but sounds continue + No Game over BGM"</Description>
+      <Options moActivateChildrenAsWell="1" moDeactivateChildrenAsWell="1"/>
+      <GroupHeader>1</GroupHeader>
+      <CheatEntries>
+        <CheatEntry>
+          <ID>21917</ID>
+          <Description>"Keep scene audio after death (A1)"</Description>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>{$lua}
+if syntaxcheck then return end
+local lifecycle=(function()
+-- Shared by the three standalone tables; bootstrapped by each entry.
+local previous=_G.RE6TableLifecycle20260915
+if previous and previous.revision==5 then return previous end
+local M=previous or {states={},serial=0}
+if M.timer then M.timer.Enabled=false;M.timer.destroy() end
+M.revision=5
+local function api(name,...)
+  local args={...}
+  for i,v in ipairs(args) do args[i]={type=0,value=v} end
+  return executeCodeLocalEx(getAddress(name,true),table.unpack(args))
+end
+local function must(v,name) assert(v and v~=0,name..' failed');return v end
+local function bytes(hex)
+  local out={};for v in hex:gmatch('%x%x') do out[#out+1]=tonumber(v,16) end;return out
+end
+local function equal(a,b)
+  if not a or #a~=#b then return false end
+  for i,v in ipairs(b) do if a[i]~=v then return false end end;return true
+end
+local function u32(t,i)
+  i=(i or 0)+1;return t[i]|t[i+1]&lt;&lt;8|t[i+2]&lt;&lt;16|t[i+3]&lt;&lt;24
+end
+local function packed(v)
+  return {v&amp;255,(v&gt;&gt;8)&amp;255,(v&gt;&gt;16)&amp;255,(v&gt;&gt;24)&amp;255}
+end
+local function join(...)
+  local out={};for _,a in ipairs({...}) do for _,b in ipairs(a) do out[#out+1]=b end end;return out
+end
+function M.alive(s)
+  if not s.handle then return false end
+  local wait=api('kernel32.WaitForSingleObject',s.handle,0)
+  assert(wait==0 or wait==258,'Cannot query the original game lifetime');return wait==258
+end
+function M.current(s)
+  return M.alive(s) and s.pid==getOpenedProcessID() and getAddressSafe('BH6.exe')==s.base
+end
+local function read(s,address,n)
+  must(api('kernel32.ReadProcessMemory',s.handle,address,s.buffer.Memory,n,s.scratch.Memory),'ReadProcessMemory')
+  assert(readQwordLocal(s.scratch.Memory)==n,'Partial memory read')
+  s.buffer.Position=0;return s.buffer.read(n)
+end
+local function write(s,address,data)
+  s.buffer.Position=0;s.buffer.write(data)
+  must(api('kernel32.WriteProcessMemory',s.handle,address,s.buffer.Memory,#data,s.scratch.Memory),'WriteProcessMemory')
+  assert(readQwordLocal(s.scratch.Memory)==#data and equal(read(s,address,#data),data),'Patch readback mismatch')
+  must(api('kernel32.FlushInstructionCache',s.handle,address,#data),'FlushInstructionCache')
+end
+local function protect(s,address,n,value)
+  must(api('kernel32.VirtualProtectEx',s.handle,address,n,value,s.scratch.Memory),'VirtualProtectEx')
+  return readIntegerLocal(s.scratch.Memory)
+end
+local function busy(s,changes)
+  local snap=api('kernel32.CreateToolhelp32Snapshot',4,0)
+  assert(snap and snap~=0 and snap~=-1,'Thread snapshot failed')
+  local result=false
+  local ok,err=pcall(function()
+    local p=s.scratch.Memory+0x100;writeIntegerLocal(p,28)
+    local more=must(api('kernel32.Thread32First',snap,p),'Thread32First')
+    local count=0
+    while more~=0 do
+      if readIntegerLocal(p+12)==s.pid then
+        local h=must(api('kernel32.OpenThread',0x48,0,readIntegerLocal(p+8)),'OpenThread')
+        local ctx=s.scratch.Memory+0x200;writeIntegerLocal(ctx,0x10001)
+        local got=api('kernel32.Wow64GetThreadContext',h,ctx)
+        local ip=readIntegerLocal(ctx+184);api('kernel32.CloseHandle',h)
+        must(got,'Wow64GetThreadContext');count=count+1
+        for _,v in ipairs(changes) do if ip&gt;=v.address and ip&lt;v.address+#v.old then result=true end end
+      end
+      writeIntegerLocal(p,28);more=api('kernel32.Thread32Next',snap,p)
+    end
+    assert(count&gt;0,'No game threads found')
+  end)
+  api('kernel32.CloseHandle',snap);assert(ok,err);return result
+end
+-- Only entry-point writes require a short, verified transaction. Caves are retained.
+function M.change(s,changes)
+  if #changes==0 then return end
+  assert(M.alive(s),'The original game process exited')
+  for attempt=1,30 do
+    local status=api('ntdll.NtSuspendProcess',s.handle)
+    assert(status and (status&amp;0x80000000)==0,'NtSuspendProcess failed')
+    s.suspended=true
+    local retry=false;local attempted={};local protections={}
+    local ok,err=xpcall(function()
+      retry=busy(s,changes);if retry then return end
+      for _,v in ipairs(changes) do assert(equal(read(s,v.address,#v.old),v.old),'Patch changed during recovery') end
+      for _,v in ipairs(changes) do
+        protections[#protections+1]={v.address,#v.old,protect(s,v.address,#v.old,0x40)}
+        attempted[#attempted+1]=v;write(s,v.address,v.new)
+      end
+    end,debug.traceback)
+    if not ok then
+      for i=#attempted,1,-1 do
+        local v=attempted[i]
+        if not pcall(write,s,v.address,v.old) then s.critical=true end
+      end
+    end
+    for i=#protections,1,-1 do
+      local p=protections[i];local restored,why=pcall(protect,s,p[1],p[2],p[3])
+      if not restored then ok=false;err=tostring(err)..'\n'..tostring(why) end
+    end
+    if s.critical then error('Patch rollback failed; controller retained for recovery') end
+    local resumed=api('ntdll.NtResumeProcess',s.handle)
+    assert(resumed and (resumed&amp;0x80000000)==0,'NtResumeProcess failed; controller retained')
+    s.suspended=false
+    assert(ok,err)
+    if not retry then return end
+    sleep(5)
+  end
+  error('Game thread is inside the patch; retry enabling this entry')
+end
+local function jump(s,address,opcode)
+  local t=read(s,address,5);assert(t[1]==opcode,'Unknown hook opcode')
+  return (address+5+u32(t,1))&amp;0xffffffff
+end
+local function checkKeepBlood(s,site,code)
+  local function expect(p,hex)
+    local b=bytes(hex);assert(equal(read(s,p,#b),b),'Unknown Game Over hook');return p+#b
+  end
+  local function branch(p,short,near)
+    local b=read(s,p,6)
+    if b[1]==short then return p+2+((b[2]&gt;=128) and b[2]-256 or b[2]),p+2 end
+    assert(b[1]==0x0f and b[2]==near,'Unknown Game Over condition')
+    return (p+6+u32(b,2))&amp;0xffffffff,p+6
+  end
+  local function jmp(p)
+    local b=read(s,p,5)
+    if b[1]==0xeb then return p+2+((b[2]&gt;=128) and b[2]-256 or b[2]) end
+    return jump(s,p,0xe9)
+  end
+  local p=expect(code,'83 F9 01');local skip
+  skip,p=branch(p,0x75,0x85)
+  assert(equal(read(s,p,6),join(bytes('81 3E'),packed(s.base+0x1190f40))),'Unknown Game Over type gate');p=p+6
+  local skip2;skip2,p=branch(p,0x74,0x84);assert(skip2==skip,'Unknown Game Over target')
+  p=expect(p,'8B 16 83 E0 FA')
+  local ret=jmp(p)
+  assert(jmp(skip)==site+0x59 and jmp(ret)==site+7,'Unknown Game Over return')
+end
+function M.recover(s,spec)
+  local changes={}
+  for _,v in ipairs(spec or {}) do
+    local address=s.base+v.rva;local original=bytes(v.original)
+    local current=read(s,address,#original)
+    if v.context then assert(equal(read(s,address+#original,#bytes(v.context)),bytes(v.context)),'Unsupported patch context') end
+    if not equal(current,original) then
+      if v.kind=='camera' then
+        local code=jump(s,address,0xe9)
+        assert(equal(read(s,code,14),join(bytes('89 0D'),packed(code-4),original))
+          and jump(s,code+14,0xe9)==address+8,'Unknown camera hook; no takeover attempted')
+        local padding={current[6],current[7],current[8]}
+        assert(equal(padding,{0x90,0x90,0x90}) or equal(padding,{0x0f,0x1f,0x00}),'Unknown camera padding')
+      elseif v.kind=='input' then
+        local code=jump(s,address,0xe9)
+        assert(equal(read(s,code-6,6),original) and equal(read(s,code,27),
+          join(bytes('83 A6 AC 02 00 00 00 83 A6 B0 02 00 00 00 83 A6 B4 02 00 00 00'),original))
+          and jump(s,code+27,0xe9)==address+6 and current[6]==0x90,'Unknown controller input hook')
+      elseif v.kind=='blood' then
+        assert(current[6]==0x90 and current[7]==0x90,'Unknown Game Over patch')
+        checkKeepBlood(s,address,jump(s,address,0xe9))
+      else assert(equal(current,bytes(v.patched)),'Foreign patch detected; memory was left unchanged') end
+      changes[#changes+1]={address=address,old=current,new=original}
+    end
+  end
+  -- Validate every site before restoring any of them.
+  M.change(s,changes)
+end
+local function localStop(s)
+  for _,name in ipairs(s.meta.timers or {}) do
+    local t=_G[name];if t then t.Enabled=false;t.destroy();_G[name]=nil end
+  end
+  if s.key=='21848' then _G.fc_loop_running=false end
+  for name,address in pairs(s.symbols or {}) do
+    if getAddressSafe(name)==address then unregisterSymbol(name) end
+  end
+end
+function M.stop(s)
+  if not s or s.closed then return end
+  local running=M.alive(s)
+  if not running then s.critical=false;s.suspended=false end
+  assert(not s.critical and not s.suspended,'Unresolved patch transaction; controller retained')
+  if s.key=='1545' or s.key=='241' or s.key=='21848' then
+    for _,key in ipairs({'21848','21913','21912','241'}) do
+      if key~=s.key and (key~='241' or s.key=='1545') and M.states[key] then M.stop(M.states[key]) end
+    end
+  end
+  -- An old CE may have left companion hooks that are not checked in this new table.
+  if running and s.meta.release then M.recover(s,s.meta.release) end
+  if s.enabled and running and #(s.meta.sites or {})&gt;0 then
+    local changes={}
+    for i,v in ipairs(s.meta.sites) do
+      local address=s.base+v.rva;local original=bytes(v.original)
+      local current=read(s,address,#original)
+      if not equal(current,original) then
+        assert(s.installed[i] and equal(current,s.installed[i].data),
+          'The active patch was changed by another controller; refusing to overwrite it')
+        changes[#changes+1]={address=address,old=current,new=original}
+      end
+    end
+    -- Restore through the original handle even if CE is now viewing another process.
+    M.change(s,changes)
+    localStop(s)
+    if s.key=='9002' then extra_respawn_patch_site=nil end
+  elseif s.enabled and (M.current(s) or s.meta.ownedHandle) then
+    local ok,err=autoAssemble(s.script,s.disableInfo)
+    assert(ok,'Disable failed: '..tostring(err))
+  else localStop(s) end
+  if running then
+    for _,v in ipairs(s.meta.restore or s.meta.sites or {}) do
+      local original=bytes(v.original)
+      assert(equal(read(s,s.base+v.rva,#original),original),
+        string.format('Original bytes were NOT restored at BH6.exe+%X / 原始指令尚未恢复',v.rva))
+    end
+    for _,v in ipairs(s.meta.release or {}) do
+      local original=bytes(v.original)
+      assert(equal(read(s,s.base+v.rva,#original),original),'A companion camera patch was not restored')
+    end
+  end
+  s.enabled=false
+  if s.record then pcall(function()
+    local function reset(record,children)
+      if children then for i=record.Count-1,0,-1 do reset(record.Child[i],true) end end
+      record.disableWithoutExecute()
+    end
+    reset(s.record,s.key=='1545' or s.key=='241')
+  end) end
+  if s.lock then
+    if s.ownsLock then api('kernel32.ReleaseMutex',s.lock) end
+    api('kernel32.CloseHandle',s.lock)
+  end
+  if s.handle then api('kernel32.CloseHandle',s.handle) end
+  if s.buffer then s.buffer.destroy() end
+  if s.scratch then s.scratch.destroy() end
+  s.handle=nil;s.closed=true
+  if M.states[s.key]==s then M.states[s.key]=nil end
+end
+function M.enable(key,record,script,meta)
+  local old=M.states[key]
+  if old then
+    if M.current(old) and old.enabled then error('This feature is already active in this CE session / 此功能已在当前 CE 中启用') end
+    M.stop(old)
+  end
+  local s={key=key,record=record,script=script,meta=meta or {}}
+  M.serial=M.serial+1;s.serial=M.serial;M.states[key]=s
+  local ok,err=xpcall(function()
+    s.pid=getOpenedProcessID();s.base=getAddressSafe('BH6.exe')
+    assert(s.pid and s.pid&gt;0 and s.base,'Attach BH6.exe first / 请先连接 BH6.exe')
+    s.handle=must(api('kernel32.OpenProcess',0x100c38,0,s.pid),'OpenProcess')
+    s.buffer=createMemoryStream();s.buffer.Size=0x2000
+    s.scratch=createMemoryStream();s.scratch.Size=0x1000
+    local header=read(s,s.base,0x1000);local pe=u32(header,0x3c)
+    assert(pe&gt;=64 and pe+0x54&lt;#header and u32(header,pe)==0x4550 and u32(header,pe+8)==0x51960399
+      and u32(header,pe+0x50)==0x14a1000,'Unsupported BH6.exe build')
+    local p=s.scratch.Memory
+    must(api('kernel32.GetProcessTimes',s.handle,p,p+8,p+16,p+24),'GetProcessTimes')
+    local lockKey=(key=='21915' or key=='21919') and 'game_over' or key
+    for _,other in pairs(M.states) do
+      assert(other==s or other.lockKey~=lockKey or not M.alive(other),
+        'An overlapping option is already active / 修改同一地址的另一个选项已启用')
+    end
+    s.lockKey=lockKey
+    local name=string.format('Local\\RE6_CT_%s_%d_%08X%08X',lockKey,s.pid,readIntegerLocal(p+4),readIntegerLocal(p))
+    s.lock=must(executeCodeLocalEx(getAddress('kernel32.CreateMutexW',true),
+      {type=0,value=0},{type=0,value=0},{type=4,value=name}),'CreateMutexW')
+    local acquired=api('kernel32.WaitForSingleObject',s.lock,0)
+    assert(acquired==0 or acquired==0x80,'Another CE owns this feature / 另一份 CE 正在控制此功能')
+    s.ownsLock=true
+    M.recover(s,s.meta.sites)
+    -- Only this entry's old names can survive a CE process retarget.
+    for _,name in ipairs(s.meta.symbols or {}) do unregisterSymbol(name) end
+    for _,name in ipairs(s.meta.staleSymbols or {}) do unregisterSymbol(name) end
+    if key=='1545' or key=='21848' then _G.fc_loop_running=false end
+    local assembled,info=autoAssemble(script)
+    assert(assembled,tostring(info));s.disableInfo=info;s.enabled=true
+    s.installed={}
+    for _,v in ipairs(s.meta.sites or {}) do
+      local address=s.base+v.rva
+      s.installed[#s.installed+1]={address=address,data=read(s,address,#bytes(v.original))}
+    end
+    s.symbols={}
+    for _,name in ipairs(s.meta.symbols or {}) do s.symbols[name]=getAddressSafe(name) end
+  end,debug.traceback)
+  if not ok then
+    if not s.critical and not s.suspended then pcall(M.stop,s) end
+    error(err)
+  end
+end
+function M.disable(key,meta)
+  local s=M.states[key]
+  if s and meta then s.meta=meta end
+  M.stop(s)
+end
+function M.stopAll()
+  local list={};for _,s in pairs(M.states) do list[#list+1]=s end
+  table.sort(list,function(a,b)return a.serial&gt;b.serial end)
+  local errors={}
+  for _,s in ipairs(list) do local ok,why=pcall(M.stop,s);if not ok then errors[#errors+1]=tostring(why) end end
+  return #errors==0,table.concat(errors,'\n')
+end
+M.timer=createTimer(nil,false);M.timer.Interval=250
+M.timer.OnTimer=function()
+  local stale={}
+  for _,s in pairs(M.states) do
+    local ok,current=pcall(M.current,s)
+    if (s.enabled or s.suspended or s.critical) and ok and not current then stale[#stale+1]=s end
+  end
+  table.sort(stale,function(a,b)return a.serial&gt;b.serial end)
+  for _,s in ipairs(stale) do
+    local ok,err=pcall(M.stop,s)
+    if not ok and not s.reported then s.reported=true;print('[RE6 lifecycle] '..tostring(err)) end
+  end
+end
+M.timer.Enabled=true
+local form=getMainForm();local previous=form.OnCloseQuery
+form.OnCloseQuery=function(sender)
+  if previous and previous(sender)==false then return false end
+  local ok,err=M.stopAll()
+  if not ok then showMessage('Unable to restore one of this table\'s patches / 有补丁未能恢复：\n'..err);return false end
+  return true
+end
+_G.RE6TableLifecycle20260915=M
+return M
+end)()
+{$asm}
+[ENABLE]
+{$lua}
+if syntaxcheck then return end
+-- Encoded payload prevents CE's outer AA parser from interpreting nested section directives.
+local source=('7b20424836202f20524536202d2041313a20736b6970207468652047616d654f76657220617564696f2d6d6f64652072657175657374202d20544553540a0a2020507572706f73653a206b65657020646561746820616e696d6174696f6e73207768696c652074657374696e6720636f6e74696e756564207363656e6520617564696f2e0a20205573657220636f6e6669726d656420636f6e74696e75656420617564696f206166746572206465617468206f6e20323032362d30392d30372e0a20204f6e65207363656e6172696f20746573746564207769746820746865206f726967696e616c2047656d696e6920706174636820656e61626c65642e0a2020416e696d6174696f6e2064657461696c7320616e64206f74686572206465617468207363656e6172696f73206e65656420667572746865722074657374696e672e0a0a2020416e616c797a656420455845205348413235363a0a2020373242353244303641314338373841364436363730314231393241343735353742443834344130343733443646334341464230433733363134343233354637340a0a2020536974653a204248362e6578652b37314233352c2063616c6c204248362e6578652b3133373441300a202043616c6c65653a2073657473207342696f536f756e64206d6f6465203720616e642074776f20766f6c756d65207461726765747320746f207a65726f2e0a20204f6e6c7920746869732063616c6c2073697465206973206368616e6765642e204e6f20686f6f6b2c2074696d65722c20616c6c6f636174696f6e206f722074726163652e0a0a202055736520656974686572204b45455020424c4f4f44206f722047656d696e6920617320746865204e6f2047616d65204f766572206f7074696f6e2c206e6576657220626f74682e0a202044697361626c65206f74686572206578706572696d656e74616c2047616d654f76657220706174636865732e20456e61626c65204131204245464f52452064656174682e0a202052656c6f61642074686520636865636b706f696e7420746f20726573746f726520616e20616c72656164792d6d75746564207363656e652066697273742e0a202044697361626c696e6720413120726573746f72657320636f64652c206e6f7420616e20616c72656164792d6368616e67656420617564696f2073746174652e0a7d0a0a5b454e41424c455d0a616f627363616e6d6f64756c65286268365f61315f617564696f5f63616c6c2c4248362e6578652c3842203044203543203436203836203031204538203636203539203043203030203842203044203343203532203743203031203641203030204538203639204246203043203030290a617373657274286268365f61315f617564696f5f63616c6c2b362c4538203636203539203043203030290a617373657274284248362e6578652b3133373531382c4337203836203430203341203035203030203037203030203030203030204337203836203438203341203035203030203030203030203030203030204633203046203131203845203630203339203035203030204633203046203131203845203638203339203035203030290a726567697374657273796d626f6c286268365f61315f617564696f5f63616c6c290a0a6268365f61315f617564696f5f63616c6c2b363a0a202064622039302039302039302039302039300a0a5b44495341424c455d0a617373657274286268365f61315f617564696f5f63616c6c2b362c3930203930203930203930203930290a6268365f61315f617564696f5f63616c6c2b363a0a202064622045382036362035392030432030300a756e726567697374657273796d626f6c286268365f61315f617564696f5f63616c6c290a'):gsub('..',function(b)return string.char(tonumber(b,16))end)
+_G.RE6TableLifecycle20260915.enable('21917',memrec or getAddressList().getMemoryRecordByID(21917),source,{["sites"]={{["rva"]=465717,["original"]="e866590c00",["patched"]="9090909090",["context"]="8b0d3c527c016a00"}},["symbols"]={"bh6_a1_audio_call"}})
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+local lifecycle=_G.RE6TableLifecycle20260915
+if lifecycle then lifecycle.disable('21917',{["sites"]={{["rva"]=465717,["original"]="e866590c00",["patched"]="9090909090",["context"]="8b0d3c527c016a00"}},["symbols"]={"bh6_a1_audio_call"}}) end
+{$asm}
+</AssemblerScript>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>21918</ID>
+          <Description>"No Game Over Sound - bgm0100 to bgm0104 (B1)"</Description>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>{$lua}
+if syntaxcheck then return end
+local lifecycle=(function()
+-- Shared by the three standalone tables; bootstrapped by each entry.
+local previous=_G.RE6TableLifecycle20260915
+if previous and previous.revision==5 then return previous end
+local M=previous or {states={},serial=0}
+if M.timer then M.timer.Enabled=false;M.timer.destroy() end
+M.revision=5
+local function api(name,...)
+  local args={...}
+  for i,v in ipairs(args) do args[i]={type=0,value=v} end
+  return executeCodeLocalEx(getAddress(name,true),table.unpack(args))
+end
+local function must(v,name) assert(v and v~=0,name..' failed');return v end
+local function bytes(hex)
+  local out={};for v in hex:gmatch('%x%x') do out[#out+1]=tonumber(v,16) end;return out
+end
+local function equal(a,b)
+  if not a or #a~=#b then return false end
+  for i,v in ipairs(b) do if a[i]~=v then return false end end;return true
+end
+local function u32(t,i)
+  i=(i or 0)+1;return t[i]|t[i+1]&lt;&lt;8|t[i+2]&lt;&lt;16|t[i+3]&lt;&lt;24
+end
+local function packed(v)
+  return {v&amp;255,(v&gt;&gt;8)&amp;255,(v&gt;&gt;16)&amp;255,(v&gt;&gt;24)&amp;255}
+end
+local function join(...)
+  local out={};for _,a in ipairs({...}) do for _,b in ipairs(a) do out[#out+1]=b end end;return out
+end
+function M.alive(s)
+  if not s.handle then return false end
+  local wait=api('kernel32.WaitForSingleObject',s.handle,0)
+  assert(wait==0 or wait==258,'Cannot query the original game lifetime');return wait==258
+end
+function M.current(s)
+  return M.alive(s) and s.pid==getOpenedProcessID() and getAddressSafe('BH6.exe')==s.base
+end
+local function read(s,address,n)
+  must(api('kernel32.ReadProcessMemory',s.handle,address,s.buffer.Memory,n,s.scratch.Memory),'ReadProcessMemory')
+  assert(readQwordLocal(s.scratch.Memory)==n,'Partial memory read')
+  s.buffer.Position=0;return s.buffer.read(n)
+end
+local function write(s,address,data)
+  s.buffer.Position=0;s.buffer.write(data)
+  must(api('kernel32.WriteProcessMemory',s.handle,address,s.buffer.Memory,#data,s.scratch.Memory),'WriteProcessMemory')
+  assert(readQwordLocal(s.scratch.Memory)==#data and equal(read(s,address,#data),data),'Patch readback mismatch')
+  must(api('kernel32.FlushInstructionCache',s.handle,address,#data),'FlushInstructionCache')
+end
+local function protect(s,address,n,value)
+  must(api('kernel32.VirtualProtectEx',s.handle,address,n,value,s.scratch.Memory),'VirtualProtectEx')
+  return readIntegerLocal(s.scratch.Memory)
+end
+local function busy(s,changes)
+  local snap=api('kernel32.CreateToolhelp32Snapshot',4,0)
+  assert(snap and snap~=0 and snap~=-1,'Thread snapshot failed')
+  local result=false
+  local ok,err=pcall(function()
+    local p=s.scratch.Memory+0x100;writeIntegerLocal(p,28)
+    local more=must(api('kernel32.Thread32First',snap,p),'Thread32First')
+    local count=0
+    while more~=0 do
+      if readIntegerLocal(p+12)==s.pid then
+        local h=must(api('kernel32.OpenThread',0x48,0,readIntegerLocal(p+8)),'OpenThread')
+        local ctx=s.scratch.Memory+0x200;writeIntegerLocal(ctx,0x10001)
+        local got=api('kernel32.Wow64GetThreadContext',h,ctx)
+        local ip=readIntegerLocal(ctx+184);api('kernel32.CloseHandle',h)
+        must(got,'Wow64GetThreadContext');count=count+1
+        for _,v in ipairs(changes) do if ip&gt;=v.address and ip&lt;v.address+#v.old then result=true end end
+      end
+      writeIntegerLocal(p,28);more=api('kernel32.Thread32Next',snap,p)
+    end
+    assert(count&gt;0,'No game threads found')
+  end)
+  api('kernel32.CloseHandle',snap);assert(ok,err);return result
+end
+-- Only entry-point writes require a short, verified transaction. Caves are retained.
+function M.change(s,changes)
+  if #changes==0 then return end
+  assert(M.alive(s),'The original game process exited')
+  for attempt=1,30 do
+    local status=api('ntdll.NtSuspendProcess',s.handle)
+    assert(status and (status&amp;0x80000000)==0,'NtSuspendProcess failed')
+    s.suspended=true
+    local retry=false;local attempted={};local protections={}
+    local ok,err=xpcall(function()
+      retry=busy(s,changes);if retry then return end
+      for _,v in ipairs(changes) do assert(equal(read(s,v.address,#v.old),v.old),'Patch changed during recovery') end
+      for _,v in ipairs(changes) do
+        protections[#protections+1]={v.address,#v.old,protect(s,v.address,#v.old,0x40)}
+        attempted[#attempted+1]=v;write(s,v.address,v.new)
+      end
+    end,debug.traceback)
+    if not ok then
+      for i=#attempted,1,-1 do
+        local v=attempted[i]
+        if not pcall(write,s,v.address,v.old) then s.critical=true end
+      end
+    end
+    for i=#protections,1,-1 do
+      local p=protections[i];local restored,why=pcall(protect,s,p[1],p[2],p[3])
+      if not restored then ok=false;err=tostring(err)..'\n'..tostring(why) end
+    end
+    if s.critical then error('Patch rollback failed; controller retained for recovery') end
+    local resumed=api('ntdll.NtResumeProcess',s.handle)
+    assert(resumed and (resumed&amp;0x80000000)==0,'NtResumeProcess failed; controller retained')
+    s.suspended=false
+    assert(ok,err)
+    if not retry then return end
+    sleep(5)
+  end
+  error('Game thread is inside the patch; retry enabling this entry')
+end
+local function jump(s,address,opcode)
+  local t=read(s,address,5);assert(t[1]==opcode,'Unknown hook opcode')
+  return (address+5+u32(t,1))&amp;0xffffffff
+end
+local function checkKeepBlood(s,site,code)
+  local function expect(p,hex)
+    local b=bytes(hex);assert(equal(read(s,p,#b),b),'Unknown Game Over hook');return p+#b
+  end
+  local function branch(p,short,near)
+    local b=read(s,p,6)
+    if b[1]==short then return p+2+((b[2]&gt;=128) and b[2]-256 or b[2]),p+2 end
+    assert(b[1]==0x0f and b[2]==near,'Unknown Game Over condition')
+    return (p+6+u32(b,2))&amp;0xffffffff,p+6
+  end
+  local function jmp(p)
+    local b=read(s,p,5)
+    if b[1]==0xeb then return p+2+((b[2]&gt;=128) and b[2]-256 or b[2]) end
+    return jump(s,p,0xe9)
+  end
+  local p=expect(code,'83 F9 01');local skip
+  skip,p=branch(p,0x75,0x85)
+  assert(equal(read(s,p,6),join(bytes('81 3E'),packed(s.base+0x1190f40))),'Unknown Game Over type gate');p=p+6
+  local skip2;skip2,p=branch(p,0x74,0x84);assert(skip2==skip,'Unknown Game Over target')
+  p=expect(p,'8B 16 83 E0 FA')
+  local ret=jmp(p)
+  assert(jmp(skip)==site+0x59 and jmp(ret)==site+7,'Unknown Game Over return')
+end
+function M.recover(s,spec)
+  local changes={}
+  for _,v in ipairs(spec or {}) do
+    local address=s.base+v.rva;local original=bytes(v.original)
+    local current=read(s,address,#original)
+    if v.context then assert(equal(read(s,address+#original,#bytes(v.context)),bytes(v.context)),'Unsupported patch context') end
+    if not equal(current,original) then
+      if v.kind=='camera' then
+        local code=jump(s,address,0xe9)
+        assert(equal(read(s,code,14),join(bytes('89 0D'),packed(code-4),original))
+          and jump(s,code+14,0xe9)==address+8,'Unknown camera hook; no takeover attempted')
+        local padding={current[6],current[7],current[8]}
+        assert(equal(padding,{0x90,0x90,0x90}) or equal(padding,{0x0f,0x1f,0x00}),'Unknown camera padding')
+      elseif v.kind=='input' then
+        local code=jump(s,address,0xe9)
+        assert(equal(read(s,code-6,6),original) and equal(read(s,code,27),
+          join(bytes('83 A6 AC 02 00 00 00 83 A6 B0 02 00 00 00 83 A6 B4 02 00 00 00'),original))
+          and jump(s,code+27,0xe9)==address+6 and current[6]==0x90,'Unknown controller input hook')
+      elseif v.kind=='blood' then
+        assert(current[6]==0x90 and current[7]==0x90,'Unknown Game Over patch')
+        checkKeepBlood(s,address,jump(s,address,0xe9))
+      else assert(equal(current,bytes(v.patched)),'Foreign patch detected; memory was left unchanged') end
+      changes[#changes+1]={address=address,old=current,new=original}
+    end
+  end
+  -- Validate every site before restoring any of them.
+  M.change(s,changes)
+end
+local function localStop(s)
+  for _,name in ipairs(s.meta.timers or {}) do
+    local t=_G[name];if t then t.Enabled=false;t.destroy();_G[name]=nil end
+  end
+  if s.key=='21848' then _G.fc_loop_running=false end
+  for name,address in pairs(s.symbols or {}) do
+    if getAddressSafe(name)==address then unregisterSymbol(name) end
+  end
+end
+function M.stop(s)
+  if not s or s.closed then return end
+  local running=M.alive(s)
+  if not running then s.critical=false;s.suspended=false end
+  assert(not s.critical and not s.suspended,'Unresolved patch transaction; controller retained')
+  if s.key=='1545' or s.key=='241' or s.key=='21848' then
+    for _,key in ipairs({'21848','21913','21912','241'}) do
+      if key~=s.key and (key~='241' or s.key=='1545') and M.states[key] then M.stop(M.states[key]) end
+    end
+  end
+  -- An old CE may have left companion hooks that are not checked in this new table.
+  if running and s.meta.release then M.recover(s,s.meta.release) end
+  if s.enabled and running and #(s.meta.sites or {})&gt;0 then
+    local changes={}
+    for i,v in ipairs(s.meta.sites) do
+      local address=s.base+v.rva;local original=bytes(v.original)
+      local current=read(s,address,#original)
+      if not equal(current,original) then
+        assert(s.installed[i] and equal(current,s.installed[i].data),
+          'The active patch was changed by another controller; refusing to overwrite it')
+        changes[#changes+1]={address=address,old=current,new=original}
+      end
+    end
+    -- Restore through the original handle even if CE is now viewing another process.
+    M.change(s,changes)
+    localStop(s)
+    if s.key=='9002' then extra_respawn_patch_site=nil end
+  elseif s.enabled and (M.current(s) or s.meta.ownedHandle) then
+    local ok,err=autoAssemble(s.script,s.disableInfo)
+    assert(ok,'Disable failed: '..tostring(err))
+  else localStop(s) end
+  if running then
+    for _,v in ipairs(s.meta.restore or s.meta.sites or {}) do
+      local original=bytes(v.original)
+      assert(equal(read(s,s.base+v.rva,#original),original),
+        string.format('Original bytes were NOT restored at BH6.exe+%X / 原始指令尚未恢复',v.rva))
+    end
+    for _,v in ipairs(s.meta.release or {}) do
+      local original=bytes(v.original)
+      assert(equal(read(s,s.base+v.rva,#original),original),'A companion camera patch was not restored')
+    end
+  end
+  s.enabled=false
+  if s.record then pcall(function()
+    local function reset(record,children)
+      if children then for i=record.Count-1,0,-1 do reset(record.Child[i],true) end end
+      record.disableWithoutExecute()
+    end
+    reset(s.record,s.key=='1545' or s.key=='241')
+  end) end
+  if s.lock then
+    if s.ownsLock then api('kernel32.ReleaseMutex',s.lock) end
+    api('kernel32.CloseHandle',s.lock)
+  end
+  if s.handle then api('kernel32.CloseHandle',s.handle) end
+  if s.buffer then s.buffer.destroy() end
+  if s.scratch then s.scratch.destroy() end
+  s.handle=nil;s.closed=true
+  if M.states[s.key]==s then M.states[s.key]=nil end
+end
+function M.enable(key,record,script,meta)
+  local old=M.states[key]
+  if old then
+    if M.current(old) and old.enabled then error('This feature is already active in this CE session / 此功能已在当前 CE 中启用') end
+    M.stop(old)
+  end
+  local s={key=key,record=record,script=script,meta=meta or {}}
+  M.serial=M.serial+1;s.serial=M.serial;M.states[key]=s
+  local ok,err=xpcall(function()
+    s.pid=getOpenedProcessID();s.base=getAddressSafe('BH6.exe')
+    assert(s.pid and s.pid&gt;0 and s.base,'Attach BH6.exe first / 请先连接 BH6.exe')
+    s.handle=must(api('kernel32.OpenProcess',0x100c38,0,s.pid),'OpenProcess')
+    s.buffer=createMemoryStream();s.buffer.Size=0x2000
+    s.scratch=createMemoryStream();s.scratch.Size=0x1000
+    local header=read(s,s.base,0x1000);local pe=u32(header,0x3c)
+    assert(pe&gt;=64 and pe+0x54&lt;#header and u32(header,pe)==0x4550 and u32(header,pe+8)==0x51960399
+      and u32(header,pe+0x50)==0x14a1000,'Unsupported BH6.exe build')
+    local p=s.scratch.Memory
+    must(api('kernel32.GetProcessTimes',s.handle,p,p+8,p+16,p+24),'GetProcessTimes')
+    local lockKey=(key=='21915' or key=='21919') and 'game_over' or key
+    for _,other in pairs(M.states) do
+      assert(other==s or other.lockKey~=lockKey or not M.alive(other),
+        'An overlapping option is already active / 修改同一地址的另一个选项已启用')
+    end
+    s.lockKey=lockKey
+    local name=string.format('Local\\RE6_CT_%s_%d_%08X%08X',lockKey,s.pid,readIntegerLocal(p+4),readIntegerLocal(p))
+    s.lock=must(executeCodeLocalEx(getAddress('kernel32.CreateMutexW',true),
+      {type=0,value=0},{type=0,value=0},{type=4,value=name}),'CreateMutexW')
+    local acquired=api('kernel32.WaitForSingleObject',s.lock,0)
+    assert(acquired==0 or acquired==0x80,'Another CE owns this feature / 另一份 CE 正在控制此功能')
+    s.ownsLock=true
+    M.recover(s,s.meta.sites)
+    -- Only this entry's old names can survive a CE process retarget.
+    for _,name in ipairs(s.meta.symbols or {}) do unregisterSymbol(name) end
+    for _,name in ipairs(s.meta.staleSymbols or {}) do unregisterSymbol(name) end
+    if key=='1545' or key=='21848' then _G.fc_loop_running=false end
+    local assembled,info=autoAssemble(script)
+    assert(assembled,tostring(info));s.disableInfo=info;s.enabled=true
+    s.installed={}
+    for _,v in ipairs(s.meta.sites or {}) do
+      local address=s.base+v.rva
+      s.installed[#s.installed+1]={address=address,data=read(s,address,#bytes(v.original))}
+    end
+    s.symbols={}
+    for _,name in ipairs(s.meta.symbols or {}) do s.symbols[name]=getAddressSafe(name) end
+  end,debug.traceback)
+  if not ok then
+    if not s.critical and not s.suspended then pcall(M.stop,s) end
+    error(err)
+  end
+end
+function M.disable(key,meta)
+  local s=M.states[key]
+  if s and meta then s.meta=meta end
+  M.stop(s)
+end
+function M.stopAll()
+  local list={};for _,s in pairs(M.states) do list[#list+1]=s end
+  table.sort(list,function(a,b)return a.serial&gt;b.serial end)
+  local errors={}
+  for _,s in ipairs(list) do local ok,why=pcall(M.stop,s);if not ok then errors[#errors+1]=tostring(why) end end
+  return #errors==0,table.concat(errors,'\n')
+end
+M.timer=createTimer(nil,false);M.timer.Interval=250
+M.timer.OnTimer=function()
+  local stale={}
+  for _,s in pairs(M.states) do
+    local ok,current=pcall(M.current,s)
+    if (s.enabled or s.suspended or s.critical) and ok and not current then stale[#stale+1]=s end
+  end
+  table.sort(stale,function(a,b)return a.serial&gt;b.serial end)
+  for _,s in ipairs(stale) do
+    local ok,err=pcall(M.stop,s)
+    if not ok and not s.reported then s.reported=true;print('[RE6 lifecycle] '..tostring(err)) end
+  end
+end
+M.timer.Enabled=true
+local form=getMainForm();local previous=form.OnCloseQuery
+form.OnCloseQuery=function(sender)
+  if previous and previous(sender)==false then return false end
+  local ok,err=M.stopAll()
+  if not ok then showMessage('Unable to restore one of this table\'s patches / 有补丁未能恢复：\n'..err);return false end
+  return true
+end
+_G.RE6TableLifecycle20260915=M
+return M
+end)()
+{$asm}
+[ENABLE]
+{$lua}
+if syntaxcheck then return end
+-- Encoded payload prevents CE's outer AA parser from interpreting nested section directives.
+local source=('7b20424836202f20524536202d2042313a20626c6f636b20636f6d6d6f6e2064656174682042474d2072657175657374730a0a2020546172676574733a2062676d303130302e736e6777207468726f7567682062676d303130342e736e67772e0a202043757272656e7420736e645f636d6e5f62676d2e7374712049447320312e2e35207265666572656e636520736f7572636520726f777320302e2e342e0a20205468652074776f2076657269666965642063616c6c6572732062656c6f772072657175657374206f6e6c79207468657365204944732e0a202062676d36363636202849442036292c206f746865722042474d207461626c657320616e64207363656e6520617564696f2061726520756e61666665637465642e0a0a2020416e616c797a656420455845205348413235363a0a2020373242353244303641314338373841364436363730314231393241343735353742443834344130343733443646334341464230433733363134343233354637340a0a20204248362e6578652b37314237423a2049442031202d3e20636f6d6d6f6e2042474d2077726170706572202b3133424142302e0a20204248362e6578652b3545363943443a20494420322f332f342f35202d3e2073616d6520777261707065722e0a2020546865206f726967696e616c2063616c6c656520757365732052455420382e20414444204553502c38207265706c616365732069747320737461636b20636c65616e75702e0a2020426f74682063616c6c6572732069676e6f7265206974732072657475726e2076616c75653b206e6f20696e6a656374656420636f6465206973206e65656465642e0a0a2020456e61626c65206265666f726520746865206e6578742064656174682e204578697374696e6720706c61796261636b206973206e6f742073746f707065642e0a20204b65657020413120616e64207468652073656c6563746564204e6f2047616d65204f766572206f7074696f6e20656e61626c65642e0a202054686520666976652066696c6573206d7573742068617665207468656972206f726967696e616c206e616d657320666f7220612076616c696420617564696f20746573742e0a20205468697320656e747279206e657665722072656e616d65732c2064656c657465732c206f722065646974732066696c65732e0a202047616d65706c617920766572696669636174696f6e2069732070656e64696e672e0a7d0a0a5b454e41424c455d0a616f627363616e6d6f64756c65286268365f62315f72657175657374312c4248362e6578652c3842203044203543203436203836203031203537203641203031204538203330203946203043203030204645203437203035203546204333290a616f627363616e6d6f64756c65286268365f62315f7265717565737432746f352c4248362e6578652c3842203044203543203436203836203031203536203530204538204445203530204235204646203838203945203332203032203030203030203046203537204330290a617373657274286268365f62315f72657175657374312b392c4538203330203946203043203030290a617373657274286268365f62315f7265717565737432746f352b382c4538204445203530204235204646290a617373657274284248362e6578652b3133424142302c3536203537203842204639203842204237204543203339203035203030203835204636203734203446290a617373657274284248362e6578652b3133424230442c3546203545204332203038203030290a617373657274284248362e6578652b3545363941422c4238203032203030203030203030204542203133204238203033203030203030203030204542203043204238203034203030203030203030204542203035204238203035203030203030203030290a726567697374657273796d626f6c286268365f62315f7265717565737431290a726567697374657273796d626f6c286268365f62315f7265717565737432746f35290a0a6268365f62315f72657175657374312b393a0a202064622038332043342030382039302039300a6268365f62315f7265717565737432746f352b383a0a202064622038332043342030382039302039300a0a5b44495341424c455d0a617373657274286268365f62315f72657175657374312b392c3833204334203038203930203930290a617373657274286268365f62315f7265717565737432746f352b382c3833204334203038203930203930290a6268365f62315f72657175657374312b393a0a202064622045382033302039462030432030300a6268365f62315f7265717565737432746f352b383a0a202064622045382044452035302042352046460a756e726567697374657273796d626f6c286268365f62315f7265717565737431290a756e726567697374657273796d626f6c286268365f62315f7265717565737432746f35290a'):gsub('..',function(b)return string.char(tonumber(b,16))end)
+_G.RE6TableLifecycle20260915.enable('21918',memrec or getAddressList().getMemoryRecordByID(21918),source,{["sites"]={{["rva"]=465787,["original"]="e8309f0c00",["patched"]="83c4089090",["context"]="fe47055fc38b473c"},{["rva"]=6187469,["original"]="e8de50b5ff",["patched"]="83c4089090",["context"]="889e320200000f57"}},["symbols"]={"bh6_b1_request1","bh6_b1_request2to5"}})
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+local lifecycle=_G.RE6TableLifecycle20260915
+if lifecycle then lifecycle.disable('21918',{["sites"]={{["rva"]=465787,["original"]="e8309f0c00",["patched"]="83c4089090",["context"]="fe47055fc38b473c"},{["rva"]=6187469,["original"]="e8de50b5ff",["patched"]="83c4089090",["context"]="889e320200000f57"}},["symbols"]={"bh6_b1_request1","bh6_b1_request2to5"}}) end
+{$asm}
+</AssemblerScript>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>21919</ID>
+          <Description>"GPT-6 NO GAME OVER - KEEP BLOOD EFFECT - HOT KEY F8"</Description>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>{$lua}
+if syntaxcheck then return end
+local lifecycle=(function()
+-- Shared by the three standalone tables; bootstrapped by each entry.
+local previous=_G.RE6TableLifecycle20260915
+if previous and previous.revision==5 then return previous end
+local M=previous or {states={},serial=0}
+if M.timer then M.timer.Enabled=false;M.timer.destroy() end
+M.revision=5
+local function api(name,...)
+  local args={...}
+  for i,v in ipairs(args) do args[i]={type=0,value=v} end
+  return executeCodeLocalEx(getAddress(name,true),table.unpack(args))
+end
+local function must(v,name) assert(v and v~=0,name..' failed');return v end
+local function bytes(hex)
+  local out={};for v in hex:gmatch('%x%x') do out[#out+1]=tonumber(v,16) end;return out
+end
+local function equal(a,b)
+  if not a or #a~=#b then return false end
+  for i,v in ipairs(b) do if a[i]~=v then return false end end;return true
+end
+local function u32(t,i)
+  i=(i or 0)+1;return t[i]|t[i+1]&lt;&lt;8|t[i+2]&lt;&lt;16|t[i+3]&lt;&lt;24
+end
+local function packed(v)
+  return {v&amp;255,(v&gt;&gt;8)&amp;255,(v&gt;&gt;16)&amp;255,(v&gt;&gt;24)&amp;255}
+end
+local function join(...)
+  local out={};for _,a in ipairs({...}) do for _,b in ipairs(a) do out[#out+1]=b end end;return out
+end
+function M.alive(s)
+  if not s.handle then return false end
+  local wait=api('kernel32.WaitForSingleObject',s.handle,0)
+  assert(wait==0 or wait==258,'Cannot query the original game lifetime');return wait==258
+end
+function M.current(s)
+  return M.alive(s) and s.pid==getOpenedProcessID() and getAddressSafe('BH6.exe')==s.base
+end
+local function read(s,address,n)
+  must(api('kernel32.ReadProcessMemory',s.handle,address,s.buffer.Memory,n,s.scratch.Memory),'ReadProcessMemory')
+  assert(readQwordLocal(s.scratch.Memory)==n,'Partial memory read')
+  s.buffer.Position=0;return s.buffer.read(n)
+end
+local function write(s,address,data)
+  s.buffer.Position=0;s.buffer.write(data)
+  must(api('kernel32.WriteProcessMemory',s.handle,address,s.buffer.Memory,#data,s.scratch.Memory),'WriteProcessMemory')
+  assert(readQwordLocal(s.scratch.Memory)==#data and equal(read(s,address,#data),data),'Patch readback mismatch')
+  must(api('kernel32.FlushInstructionCache',s.handle,address,#data),'FlushInstructionCache')
+end
+local function protect(s,address,n,value)
+  must(api('kernel32.VirtualProtectEx',s.handle,address,n,value,s.scratch.Memory),'VirtualProtectEx')
+  return readIntegerLocal(s.scratch.Memory)
+end
+local function busy(s,changes)
+  local snap=api('kernel32.CreateToolhelp32Snapshot',4,0)
+  assert(snap and snap~=0 and snap~=-1,'Thread snapshot failed')
+  local result=false
+  local ok,err=pcall(function()
+    local p=s.scratch.Memory+0x100;writeIntegerLocal(p,28)
+    local more=must(api('kernel32.Thread32First',snap,p),'Thread32First')
+    local count=0
+    while more~=0 do
+      if readIntegerLocal(p+12)==s.pid then
+        local h=must(api('kernel32.OpenThread',0x48,0,readIntegerLocal(p+8)),'OpenThread')
+        local ctx=s.scratch.Memory+0x200;writeIntegerLocal(ctx,0x10001)
+        local got=api('kernel32.Wow64GetThreadContext',h,ctx)
+        local ip=readIntegerLocal(ctx+184);api('kernel32.CloseHandle',h)
+        must(got,'Wow64GetThreadContext');count=count+1
+        for _,v in ipairs(changes) do if ip&gt;=v.address and ip&lt;v.address+#v.old then result=true end end
+      end
+      writeIntegerLocal(p,28);more=api('kernel32.Thread32Next',snap,p)
+    end
+    assert(count&gt;0,'No game threads found')
+  end)
+  api('kernel32.CloseHandle',snap);assert(ok,err);return result
+end
+-- Only entry-point writes require a short, verified transaction. Caves are retained.
+function M.change(s,changes)
+  if #changes==0 then return end
+  assert(M.alive(s),'The original game process exited')
+  for attempt=1,30 do
+    local status=api('ntdll.NtSuspendProcess',s.handle)
+    assert(status and (status&amp;0x80000000)==0,'NtSuspendProcess failed')
+    s.suspended=true
+    local retry=false;local attempted={};local protections={}
+    local ok,err=xpcall(function()
+      retry=busy(s,changes);if retry then return end
+      for _,v in ipairs(changes) do assert(equal(read(s,v.address,#v.old),v.old),'Patch changed during recovery') end
+      for _,v in ipairs(changes) do
+        protections[#protections+1]={v.address,#v.old,protect(s,v.address,#v.old,0x40)}
+        attempted[#attempted+1]=v;write(s,v.address,v.new)
+      end
+    end,debug.traceback)
+    if not ok then
+      for i=#attempted,1,-1 do
+        local v=attempted[i]
+        if not pcall(write,s,v.address,v.old) then s.critical=true end
+      end
+    end
+    for i=#protections,1,-1 do
+      local p=protections[i];local restored,why=pcall(protect,s,p[1],p[2],p[3])
+      if not restored then ok=false;err=tostring(err)..'\n'..tostring(why) end
+    end
+    if s.critical then error('Patch rollback failed; controller retained for recovery') end
+    local resumed=api('ntdll.NtResumeProcess',s.handle)
+    assert(resumed and (resumed&amp;0x80000000)==0,'NtResumeProcess failed; controller retained')
+    s.suspended=false
+    assert(ok,err)
+    if not retry then return end
+    sleep(5)
+  end
+  error('Game thread is inside the patch; retry enabling this entry')
+end
+local function jump(s,address,opcode)
+  local t=read(s,address,5);assert(t[1]==opcode,'Unknown hook opcode')
+  return (address+5+u32(t,1))&amp;0xffffffff
+end
+local function checkKeepBlood(s,site,code)
+  local function expect(p,hex)
+    local b=bytes(hex);assert(equal(read(s,p,#b),b),'Unknown Game Over hook');return p+#b
+  end
+  local function branch(p,short,near)
+    local b=read(s,p,6)
+    if b[1]==short then return p+2+((b[2]&gt;=128) and b[2]-256 or b[2]),p+2 end
+    assert(b[1]==0x0f and b[2]==near,'Unknown Game Over condition')
+    return (p+6+u32(b,2))&amp;0xffffffff,p+6
+  end
+  local function jmp(p)
+    local b=read(s,p,5)
+    if b[1]==0xeb then return p+2+((b[2]&gt;=128) and b[2]-256 or b[2]) end
+    return jump(s,p,0xe9)
+  end
+  local p=expect(code,'83 F9 01');local skip
+  skip,p=branch(p,0x75,0x85)
+  assert(equal(read(s,p,6),join(bytes('81 3E'),packed(s.base+0x1190f40))),'Unknown Game Over type gate');p=p+6
+  local skip2;skip2,p=branch(p,0x74,0x84);assert(skip2==skip,'Unknown Game Over target')
+  p=expect(p,'8B 16 83 E0 FA')
+  local ret=jmp(p)
+  assert(jmp(skip)==site+0x59 and jmp(ret)==site+7,'Unknown Game Over return')
+end
+function M.recover(s,spec)
+  local changes={}
+  for _,v in ipairs(spec or {}) do
+    local address=s.base+v.rva;local original=bytes(v.original)
+    local current=read(s,address,#original)
+    if v.context then assert(equal(read(s,address+#original,#bytes(v.context)),bytes(v.context)),'Unsupported patch context') end
+    if not equal(current,original) then
+      if v.kind=='camera' then
+        local code=jump(s,address,0xe9)
+        assert(equal(read(s,code,14),join(bytes('89 0D'),packed(code-4),original))
+          and jump(s,code+14,0xe9)==address+8,'Unknown camera hook; no takeover attempted')
+        local padding={current[6],current[7],current[8]}
+        assert(equal(padding,{0x90,0x90,0x90}) or equal(padding,{0x0f,0x1f,0x00}),'Unknown camera padding')
+      elseif v.kind=='input' then
+        local code=jump(s,address,0xe9)
+        assert(equal(read(s,code-6,6),original) and equal(read(s,code,27),
+          join(bytes('83 A6 AC 02 00 00 00 83 A6 B0 02 00 00 00 83 A6 B4 02 00 00 00'),original))
+          and jump(s,code+27,0xe9)==address+6 and current[6]==0x90,'Unknown controller input hook')
+      elseif v.kind=='blood' then
+        assert(current[6]==0x90 and current[7]==0x90,'Unknown Game Over patch')
+        checkKeepBlood(s,address,jump(s,address,0xe9))
+      else assert(equal(current,bytes(v.patched)),'Foreign patch detected; memory was left unchanged') end
+      changes[#changes+1]={address=address,old=current,new=original}
+    end
+  end
+  -- Validate every site before restoring any of them.
+  M.change(s,changes)
+end
+local function localStop(s)
+  for _,name in ipairs(s.meta.timers or {}) do
+    local t=_G[name];if t then t.Enabled=false;t.destroy();_G[name]=nil end
+  end
+  if s.key=='21848' then _G.fc_loop_running=false end
+  for name,address in pairs(s.symbols or {}) do
+    if getAddressSafe(name)==address then unregisterSymbol(name) end
+  end
+end
+function M.stop(s)
+  if not s or s.closed then return end
+  local running=M.alive(s)
+  if not running then s.critical=false;s.suspended=false end
+  assert(not s.critical and not s.suspended,'Unresolved patch transaction; controller retained')
+  if s.key=='1545' or s.key=='241' or s.key=='21848' then
+    for _,key in ipairs({'21848','21913','21912','241'}) do
+      if key~=s.key and (key~='241' or s.key=='1545') and M.states[key] then M.stop(M.states[key]) end
+    end
+  end
+  -- An old CE may have left companion hooks that are not checked in this new table.
+  if running and s.meta.release then M.recover(s,s.meta.release) end
+  if s.enabled and running and #(s.meta.sites or {})&gt;0 then
+    local changes={}
+    for i,v in ipairs(s.meta.sites) do
+      local address=s.base+v.rva;local original=bytes(v.original)
+      local current=read(s,address,#original)
+      if not equal(current,original) then
+        assert(s.installed[i] and equal(current,s.installed[i].data),
+          'The active patch was changed by another controller; refusing to overwrite it')
+        changes[#changes+1]={address=address,old=current,new=original}
+      end
+    end
+    -- Restore through the original handle even if CE is now viewing another process.
+    M.change(s,changes)
+    localStop(s)
+    if s.key=='9002' then extra_respawn_patch_site=nil end
+  elseif s.enabled and (M.current(s) or s.meta.ownedHandle) then
+    local ok,err=autoAssemble(s.script,s.disableInfo)
+    assert(ok,'Disable failed: '..tostring(err))
+  else localStop(s) end
+  if running then
+    for _,v in ipairs(s.meta.restore or s.meta.sites or {}) do
+      local original=bytes(v.original)
+      assert(equal(read(s,s.base+v.rva,#original),original),
+        string.format('Original bytes were NOT restored at BH6.exe+%X / 原始指令尚未恢复',v.rva))
+    end
+    for _,v in ipairs(s.meta.release or {}) do
+      local original=bytes(v.original)
+      assert(equal(read(s,s.base+v.rva,#original),original),'A companion camera patch was not restored')
+    end
+  end
+  s.enabled=false
+  if s.record then pcall(function()
+    local function reset(record,children)
+      if children then for i=record.Count-1,0,-1 do reset(record.Child[i],true) end end
+      record.disableWithoutExecute()
+    end
+    reset(s.record,s.key=='1545' or s.key=='241')
+  end) end
+  if s.lock then
+    if s.ownsLock then api('kernel32.ReleaseMutex',s.lock) end
+    api('kernel32.CloseHandle',s.lock)
+  end
+  if s.handle then api('kernel32.CloseHandle',s.handle) end
+  if s.buffer then s.buffer.destroy() end
+  if s.scratch then s.scratch.destroy() end
+  s.handle=nil;s.closed=true
+  if M.states[s.key]==s then M.states[s.key]=nil end
+end
+function M.enable(key,record,script,meta)
+  local old=M.states[key]
+  if old then
+    if M.current(old) and old.enabled then error('This feature is already active in this CE session / 此功能已在当前 CE 中启用') end
+    M.stop(old)
+  end
+  local s={key=key,record=record,script=script,meta=meta or {}}
+  M.serial=M.serial+1;s.serial=M.serial;M.states[key]=s
+  local ok,err=xpcall(function()
+    s.pid=getOpenedProcessID();s.base=getAddressSafe('BH6.exe')
+    assert(s.pid and s.pid&gt;0 and s.base,'Attach BH6.exe first / 请先连接 BH6.exe')
+    s.handle=must(api('kernel32.OpenProcess',0x100c38,0,s.pid),'OpenProcess')
+    s.buffer=createMemoryStream();s.buffer.Size=0x2000
+    s.scratch=createMemoryStream();s.scratch.Size=0x1000
+    local header=read(s,s.base,0x1000);local pe=u32(header,0x3c)
+    assert(pe&gt;=64 and pe+0x54&lt;#header and u32(header,pe)==0x4550 and u32(header,pe+8)==0x51960399
+      and u32(header,pe+0x50)==0x14a1000,'Unsupported BH6.exe build')
+    local p=s.scratch.Memory
+    must(api('kernel32.GetProcessTimes',s.handle,p,p+8,p+16,p+24),'GetProcessTimes')
+    local lockKey=(key=='21915' or key=='21919') and 'game_over' or key
+    for _,other in pairs(M.states) do
+      assert(other==s or other.lockKey~=lockKey or not M.alive(other),
+        'An overlapping option is already active / 修改同一地址的另一个选项已启用')
+    end
+    s.lockKey=lockKey
+    local name=string.format('Local\\RE6_CT_%s_%d_%08X%08X',lockKey,s.pid,readIntegerLocal(p+4),readIntegerLocal(p))
+    s.lock=must(executeCodeLocalEx(getAddress('kernel32.CreateMutexW',true),
+      {type=0,value=0},{type=0,value=0},{type=4,value=name}),'CreateMutexW')
+    local acquired=api('kernel32.WaitForSingleObject',s.lock,0)
+    assert(acquired==0 or acquired==0x80,'Another CE owns this feature / 另一份 CE 正在控制此功能')
+    s.ownsLock=true
+    M.recover(s,s.meta.sites)
+    -- Only this entry's old names can survive a CE process retarget.
+    for _,name in ipairs(s.meta.symbols or {}) do unregisterSymbol(name) end
+    for _,name in ipairs(s.meta.staleSymbols or {}) do unregisterSymbol(name) end
+    if key=='1545' or key=='21848' then _G.fc_loop_running=false end
+    local assembled,info=autoAssemble(script)
+    assert(assembled,tostring(info));s.disableInfo=info;s.enabled=true
+    s.installed={}
+    for _,v in ipairs(s.meta.sites or {}) do
+      local address=s.base+v.rva
+      s.installed[#s.installed+1]={address=address,data=read(s,address,#bytes(v.original))}
+    end
+    s.symbols={}
+    for _,name in ipairs(s.meta.symbols or {}) do s.symbols[name]=getAddressSafe(name) end
+  end,debug.traceback)
+  if not ok then
+    if not s.critical and not s.suspended then pcall(M.stop,s) end
+    error(err)
+  end
+end
+function M.disable(key,meta)
+  local s=M.states[key]
+  if s and meta then s.meta=meta end
+  M.stop(s)
+end
+function M.stopAll()
+  local list={};for _,s in pairs(M.states) do list[#list+1]=s end
+  table.sort(list,function(a,b)return a.serial&gt;b.serial end)
+  local errors={}
+  for _,s in ipairs(list) do local ok,why=pcall(M.stop,s);if not ok then errors[#errors+1]=tostring(why) end end
+  return #errors==0,table.concat(errors,'\n')
+end
+M.timer=createTimer(nil,false);M.timer.Interval=250
+M.timer.OnTimer=function()
+  local stale={}
+  for _,s in pairs(M.states) do
+    local ok,current=pcall(M.current,s)
+    if (s.enabled or s.suspended or s.critical) and ok and not current then stale[#stale+1]=s end
+  end
+  table.sort(stale,function(a,b)return a.serial&gt;b.serial end)
+  for _,s in ipairs(stale) do
+    local ok,err=pcall(M.stop,s)
+    if not ok and not s.reported then s.reported=true;print('[RE6 lifecycle] '..tostring(err)) end
+  end
+end
+M.timer.Enabled=true
+local form=getMainForm();local previous=form.OnCloseQuery
+form.OnCloseQuery=function(sender)
+  if previous and previous(sender)==false then return false end
+  local ok,err=M.stopAll()
+  if not ok then showMessage('Unable to restore one of this table\'s patches / 有补丁未能恢复：\n'..err);return false end
+  return true
+end
+_G.RE6TableLifecycle20260915=M
+return M
+end)()
+{$asm}
+[ENABLE]
+{$lua}
+if syntaxcheck then return end
+-- Encoded payload prevents CE's outer AA parser from interpreting nested section directives.
+local source=('7b20524536202f20424836202d204750542d36204e4f2047414d45204f564552202b204b45455020424c4f4f442045464645435420285354414e44414c4f4e452054455354290a0a20205468697320656e74727920697320696e646570656e64656e742e20446f204e4f5420656e61626c6520697420746f676574686572207769746820224e6f2047616d65204f766572202d2047656d696e69222e0a20205265766973696f6e20333a20736b6970206f6e6c792075496447616d656f7665723030206d656e7520696e697469616c697a6174696f6e2e20416c6c206f746865722073556e69740a20206f626a656374732c20696e636c7564696e672064656174682d64656d6f20616e6420626c6f6f642f656666656374206f626a656374732c2072657461696e207468656972206f726967696e616c0a2020696e697469616c697a6174696f6e2e20546865207265736f75726365207461626c6520636f756e7420697320726564756365642066726f6d0a20206669766520746f20746872656520736f207468652074776f20736e645f736d313534352064656174682d736f756e6420726f777320617265206e6f74207265717565737465642e0a0a2020546172676574206275696c643a204248362e657865205348413235360a2020373242353244303641314338373841364436363730314231393241343735353742443834344130343733443646334341464230433733363134343233354637340a20204d656e7520767461626c653a2056412030313539304634303b20636f6e7374727563746f7220777269746573206974206174204248362e6578652b3539434332412e0a2020546865206f6c6420564120303136334644443020776173206120747970652d64657363726970746f7220767461626c652c206e6f7420612067616d652d6f626a65637420767461626c652e0a2020456e61626c65206265666f72652064656174683b20616e20616c72656164792d63726561746564206d656e75207265717569726573206120636865636b706f696e742072656c6f61642e0a2020544553543a20626c6f6f6420617070656172616e636520616e64206f74686572206465617468207363656e6172696f73207374696c6c20726571756972652067616d65706c617920636865636b732e0a20205468652034204b4220636f6465206275666665722069732072657573656420616e642072657461696e656420756e74696c2070726f63657373206578697420736f2064697361626c696e670a202063616e6e6f74206672656520636f6465207768696c6520612067616d6520746872656164206973207374696c6c2072657475726e696e672066726f6d2069742e0a7d0a0a5b454e41424c455d0a2f2f204f726967696e616c20736974653a20636d70206563782c31202f206a6e65202b3537202f206d6f76206564782c5b6573695d202f20616e64206561782c2d360a20616f627363616e6d6f64756c65286268365f6b6565705f626c6f6f645f736974652c4248362e6578652c3735203537203842203136203833204530204641203833204338203032203839203436203130290a20617373657274286268365f6b6565705f626c6f6f645f736974652c3735203537203842203136203833204530204641203833204338203032290a20617373657274284248362e6578652b3539434332412c4337203036203430203046203539203031290a20617373657274284248362e6578652b313139304635302c3030204246203939203030204130204343203939203030290a20616c6c6f63286268365f6b6565705f626c6f6f645f636f64655f76332c2431303030290a206c6162656c286268365f6b6565705f626c6f6f645f72657475726e290a206c6162656c286268365f6b6565705f626c6f6f645f736b6970290a20726567697374657273796d626f6c286268365f6b6565705f626c6f6f645f73697465290a0a6268365f6b6565705f626c6f6f645f636f64655f76333a0a2020636d70206563782c310a20206a6e65206268365f6b6565705f626c6f6f645f736b69700a20202f2f2075496447616d656f766572303020696e7374616e63652c206e6f74207468652064656174682d616e696d6174696f6e206f626a6563742075536d47616d654f7665722e0a2020636d702064776f726420707472205b6573695d2c4248362e6578652b313139304634300a20206a65206268365f6b6565705f626c6f6f645f736b69700a20206d6f76206564782c5b6573695d0a2020616e64206561782c2d30360a20206a6d70206268365f6b6565705f626c6f6f645f72657475726e0a0a6268365f6b6565705f626c6f6f645f736b69703a0a20206a6d70206268365f6b6565705f626c6f6f645f736974652b35390a0a6268365f6b6565705f626c6f6f645f72657475726e3a0a20206a6d70206268365f6b6565705f626c6f6f645f736974652b370a0a2f2f2075536d47616d654f766572207265736f75726365207461626c653a2072657461696e206d6f64656c2c20736f66742d68697420616e64206566666563743b206f6d6974203220736f756e64730a20616f627363616e6d6f64756c65286e676f5f75736d5f67616d656f7665725f7265736f757263655f7461626c652c4248362e6578652c4238203037203632203031203938203439203836203031203938203037203632203031203643203644203743203031203830203037203632203031204343203643203743203031203638203037203632203031204434203446203836203031203638203037203632203031204343203734203743203031203035203030203030203030290a20617373657274286e676f5f75736d5f67616d656f7665725f7265736f757263655f7461626c652b32382c3035203030203030203030290a20726567697374657273796d626f6c286e676f5f75736d5f67616d656f7665725f7265736f757263655f7461626c65290a2066756c6c416363657373286e676f5f75736d5f67616d656f7665725f7265736f757263655f7461626c652b32382c34290a6e676f5f75736d5f67616d656f7665725f7265736f757263655f7461626c652b32383a0a202064622030332030302030302030300a0a2f2f205075626c6973682074686520686f6f6b206166746572206974732064657374696e6174696f6e20636f646520686173206265656e207772697474656e2e0a6268365f6b6565705f626c6f6f645f736974653a0a20206a6d70206268365f6b6565705f626c6f6f645f636f64655f76330a202064622039302039300a0a5b44495341424c455d0a20617373657274286e676f5f75736d5f67616d656f7665725f7265736f757263655f7461626c652b32382c3033203030203030203030290a206e676f5f75736d5f67616d656f7665725f7265736f757263655f7461626c652b32383a0a202064622030352030302030302030300a20756e726567697374657273796d626f6c286e676f5f75736d5f67616d656f7665725f7265736f757263655f7461626c65290a20617373657274286268365f6b6565705f626c6f6f645f736974652c4539203f3f203f3f203f3f203f3f203930203930290a206268365f6b6565705f626c6f6f645f736974653a0a202064622037352035372038422031362038332045302046412038332043382030320a20756e726567697374657273796d626f6c286268365f6b6565705f626c6f6f645f73697465290a202f2f204b656570206268365f6b6565705f626c6f6f645f636f64655f763320616c6c6f636174656420666f7220696e2d666c696768742072657475726e7320616e642072657573652e0a'):gsub('..',function(b)return string.char(tonumber(b,16))end)
+_G.RE6TableLifecycle20260915.enable('21919',memrec or getAddressList().getMemoryRecordByID(21919),source,{["sites"]={{["rva"]=11588097,["original"]="75578b1683e0fa",["kind"]="blood",["context"]="83c8028946108b42"},{["rva"]=19007492,["original"]="05000000",["patched"]="03000000",["context"]="0000000001000000"}},["symbols"]={"bh6_keep_blood_site","ngo_usm_gameover_resource_table"},["staleSymbols"]={"bh6_keep_blood_code_v3"}})
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+local lifecycle=_G.RE6TableLifecycle20260915
+if lifecycle then lifecycle.disable('21919',{["sites"]={{["rva"]=11588097,["original"]="75578b1683e0fa",["kind"]="blood",["context"]="83c8028946108b42"},{["rva"]=19007492,["original"]="05000000",["patched"]="03000000",["context"]="0000000001000000"}},["symbols"]={"bh6_keep_blood_site","ngo_usm_gameover_resource_table"},["staleSymbols"]={"bh6_keep_blood_code_v3"}}) end
+{$asm}
+</AssemblerScript>
+          <Hotkeys>
+            <Hotkey>
+              <Action>Toggle Activation</Action>
+              <Keys>
+                <Key>119</Key>
+              </Keys>
+              <ID>0</ID>
+            </Hotkey>
+          </Hotkeys>
+        </CheatEntry>
+      </CheatEntries>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>63000</ID>
+      <Description>"GPT-6 Partial UTrainer - Don't Use when UTrainer is ON"</Description>
+      <Options moActivateChildrenAsWell="1" moDeactivateChildrenAsWell="1"/>
+      <GroupHeader>1</GroupHeader>
+      <CheatEntries>
+        <CheatEntry>
+          <ID>63001</ID>
+          <Description>"Missing Files Fix"</Description>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>{$lua}
+if syntaxcheck then return end
+local lifecycle=(function()
+-- Shared by the three standalone tables; bootstrapped by each entry.
+local previous=_G.RE6TableLifecycle20260915
+if previous and previous.revision==5 then return previous end
+local M=previous or {states={},serial=0}
+if M.timer then M.timer.Enabled=false;M.timer.destroy() end
+M.revision=5
+local function api(name,...)
+  local args={...}
+  for i,v in ipairs(args) do args[i]={type=0,value=v} end
+  return executeCodeLocalEx(getAddress(name,true),table.unpack(args))
+end
+local function must(v,name) assert(v and v~=0,name..' failed');return v end
+local function bytes(hex)
+  local out={};for v in hex:gmatch('%x%x') do out[#out+1]=tonumber(v,16) end;return out
+end
+local function equal(a,b)
+  if not a or #a~=#b then return false end
+  for i,v in ipairs(b) do if a[i]~=v then return false end end;return true
+end
+local function u32(t,i)
+  i=(i or 0)+1;return t[i]|t[i+1]&lt;&lt;8|t[i+2]&lt;&lt;16|t[i+3]&lt;&lt;24
+end
+local function packed(v)
+  return {v&amp;255,(v&gt;&gt;8)&amp;255,(v&gt;&gt;16)&amp;255,(v&gt;&gt;24)&amp;255}
+end
+local function join(...)
+  local out={};for _,a in ipairs({...}) do for _,b in ipairs(a) do out[#out+1]=b end end;return out
+end
+function M.alive(s)
+  if not s.handle then return false end
+  local wait=api('kernel32.WaitForSingleObject',s.handle,0)
+  assert(wait==0 or wait==258,'Cannot query the original game lifetime');return wait==258
+end
+function M.current(s)
+  return M.alive(s) and s.pid==getOpenedProcessID() and getAddressSafe('BH6.exe')==s.base
+end
+local function read(s,address,n)
+  must(api('kernel32.ReadProcessMemory',s.handle,address,s.buffer.Memory,n,s.scratch.Memory),'ReadProcessMemory')
+  assert(readQwordLocal(s.scratch.Memory)==n,'Partial memory read')
+  s.buffer.Position=0;return s.buffer.read(n)
+end
+local function write(s,address,data)
+  s.buffer.Position=0;s.buffer.write(data)
+  must(api('kernel32.WriteProcessMemory',s.handle,address,s.buffer.Memory,#data,s.scratch.Memory),'WriteProcessMemory')
+  assert(readQwordLocal(s.scratch.Memory)==#data and equal(read(s,address,#data),data),'Patch readback mismatch')
+  must(api('kernel32.FlushInstructionCache',s.handle,address,#data),'FlushInstructionCache')
+end
+local function protect(s,address,n,value)
+  must(api('kernel32.VirtualProtectEx',s.handle,address,n,value,s.scratch.Memory),'VirtualProtectEx')
+  return readIntegerLocal(s.scratch.Memory)
+end
+local function busy(s,changes)
+  local snap=api('kernel32.CreateToolhelp32Snapshot',4,0)
+  assert(snap and snap~=0 and snap~=-1,'Thread snapshot failed')
+  local result=false
+  local ok,err=pcall(function()
+    local p=s.scratch.Memory+0x100;writeIntegerLocal(p,28)
+    local more=must(api('kernel32.Thread32First',snap,p),'Thread32First')
+    local count=0
+    while more~=0 do
+      if readIntegerLocal(p+12)==s.pid then
+        local h=must(api('kernel32.OpenThread',0x48,0,readIntegerLocal(p+8)),'OpenThread')
+        local ctx=s.scratch.Memory+0x200;writeIntegerLocal(ctx,0x10001)
+        local got=api('kernel32.Wow64GetThreadContext',h,ctx)
+        local ip=readIntegerLocal(ctx+184);api('kernel32.CloseHandle',h)
+        must(got,'Wow64GetThreadContext');count=count+1
+        for _,v in ipairs(changes) do if ip&gt;=v.address and ip&lt;v.address+#v.old then result=true end end
+      end
+      writeIntegerLocal(p,28);more=api('kernel32.Thread32Next',snap,p)
+    end
+    assert(count&gt;0,'No game threads found')
+  end)
+  api('kernel32.CloseHandle',snap);assert(ok,err);return result
+end
+-- Only entry-point writes require a short, verified transaction. Caves are retained.
+function M.change(s,changes)
+  if #changes==0 then return end
+  assert(M.alive(s),'The original game process exited')
+  for attempt=1,30 do
+    local status=api('ntdll.NtSuspendProcess',s.handle)
+    assert(status and (status&amp;0x80000000)==0,'NtSuspendProcess failed')
+    s.suspended=true
+    local retry=false;local attempted={};local protections={}
+    local ok,err=xpcall(function()
+      retry=busy(s,changes);if retry then return end
+      for _,v in ipairs(changes) do assert(equal(read(s,v.address,#v.old),v.old),'Patch changed during recovery') end
+      for _,v in ipairs(changes) do
+        protections[#protections+1]={v.address,#v.old,protect(s,v.address,#v.old,0x40)}
+        attempted[#attempted+1]=v;write(s,v.address,v.new)
+      end
+    end,debug.traceback)
+    if not ok then
+      for i=#attempted,1,-1 do
+        local v=attempted[i]
+        if not pcall(write,s,v.address,v.old) then s.critical=true end
+      end
+    end
+    for i=#protections,1,-1 do
+      local p=protections[i];local restored,why=pcall(protect,s,p[1],p[2],p[3])
+      if not restored then ok=false;err=tostring(err)..'\n'..tostring(why) end
+    end
+    if s.critical then error('Patch rollback failed; controller retained for recovery') end
+    local resumed=api('ntdll.NtResumeProcess',s.handle)
+    assert(resumed and (resumed&amp;0x80000000)==0,'NtResumeProcess failed; controller retained')
+    s.suspended=false
+    assert(ok,err)
+    if not retry then return end
+    sleep(5)
+  end
+  error('Game thread is inside the patch; retry enabling this entry')
+end
+local function jump(s,address,opcode)
+  local t=read(s,address,5);assert(t[1]==opcode,'Unknown hook opcode')
+  return (address+5+u32(t,1))&amp;0xffffffff
+end
+local function checkKeepBlood(s,site,code)
+  local function expect(p,hex)
+    local b=bytes(hex);assert(equal(read(s,p,#b),b),'Unknown Game Over hook');return p+#b
+  end
+  local function branch(p,short,near)
+    local b=read(s,p,6)
+    if b[1]==short then return p+2+((b[2]&gt;=128) and b[2]-256 or b[2]),p+2 end
+    assert(b[1]==0x0f and b[2]==near,'Unknown Game Over condition')
+    return (p+6+u32(b,2))&amp;0xffffffff,p+6
+  end
+  local function jmp(p)
+    local b=read(s,p,5)
+    if b[1]==0xeb then return p+2+((b[2]&gt;=128) and b[2]-256 or b[2]) end
+    return jump(s,p,0xe9)
+  end
+  local p=expect(code,'83 F9 01');local skip
+  skip,p=branch(p,0x75,0x85)
+  assert(equal(read(s,p,6),join(bytes('81 3E'),packed(s.base+0x1190f40))),'Unknown Game Over type gate');p=p+6
+  local skip2;skip2,p=branch(p,0x74,0x84);assert(skip2==skip,'Unknown Game Over target')
+  p=expect(p,'8B 16 83 E0 FA')
+  local ret=jmp(p)
+  assert(jmp(skip)==site+0x59 and jmp(ret)==site+7,'Unknown Game Over return')
+end
+function M.recover(s,spec)
+  local changes={}
+  for _,v in ipairs(spec or {}) do
+    local address=s.base+v.rva;local original=bytes(v.original)
+    local current=read(s,address,#original)
+    if v.context then assert(equal(read(s,address+#original,#bytes(v.context)),bytes(v.context)),'Unsupported patch context') end
+    if not equal(current,original) then
+      if v.kind=='camera' then
+        local code=jump(s,address,0xe9)
+        assert(equal(read(s,code,14),join(bytes('89 0D'),packed(code-4),original))
+          and jump(s,code+14,0xe9)==address+8,'Unknown camera hook; no takeover attempted')
+        local padding={current[6],current[7],current[8]}
+        assert(equal(padding,{0x90,0x90,0x90}) or equal(padding,{0x0f,0x1f,0x00}),'Unknown camera padding')
+      elseif v.kind=='input' then
+        local code=jump(s,address,0xe9)
+        assert(equal(read(s,code-6,6),original) and equal(read(s,code,27),
+          join(bytes('83 A6 AC 02 00 00 00 83 A6 B0 02 00 00 00 83 A6 B4 02 00 00 00'),original))
+          and jump(s,code+27,0xe9)==address+6 and current[6]==0x90,'Unknown controller input hook')
+      elseif v.kind=='blood' then
+        assert(current[6]==0x90 and current[7]==0x90,'Unknown Game Over patch')
+        checkKeepBlood(s,address,jump(s,address,0xe9))
+      else assert(equal(current,bytes(v.patched)),'Foreign patch detected; memory was left unchanged') end
+      changes[#changes+1]={address=address,old=current,new=original}
+    end
+  end
+  -- Validate every site before restoring any of them.
+  M.change(s,changes)
+end
+local function localStop(s)
+  for _,name in ipairs(s.meta.timers or {}) do
+    local t=_G[name];if t then t.Enabled=false;t.destroy();_G[name]=nil end
+  end
+  if s.key=='21848' then _G.fc_loop_running=false end
+  for name,address in pairs(s.symbols or {}) do
+    if getAddressSafe(name)==address then unregisterSymbol(name) end
+  end
+end
+function M.stop(s)
+  if not s or s.closed then return end
+  local running=M.alive(s)
+  if not running then s.critical=false;s.suspended=false end
+  assert(not s.critical and not s.suspended,'Unresolved patch transaction; controller retained')
+  if s.key=='1545' or s.key=='241' or s.key=='21848' then
+    for _,key in ipairs({'21848','21913','21912','241'}) do
+      if key~=s.key and (key~='241' or s.key=='1545') and M.states[key] then M.stop(M.states[key]) end
+    end
+  end
+  -- An old CE may have left companion hooks that are not checked in this new table.
+  if running and s.meta.release then M.recover(s,s.meta.release) end
+  if s.enabled and running and #(s.meta.sites or {})&gt;0 then
+    local changes={}
+    for i,v in ipairs(s.meta.sites) do
+      local address=s.base+v.rva;local original=bytes(v.original)
+      local current=read(s,address,#original)
+      if not equal(current,original) then
+        assert(s.installed[i] and equal(current,s.installed[i].data),
+          'The active patch was changed by another controller; refusing to overwrite it')
+        changes[#changes+1]={address=address,old=current,new=original}
+      end
+    end
+    -- Restore through the original handle even if CE is now viewing another process.
+    M.change(s,changes)
+    localStop(s)
+    if s.key=='9002' then extra_respawn_patch_site=nil end
+  elseif s.enabled and (M.current(s) or s.meta.ownedHandle) then
+    local ok,err=autoAssemble(s.script,s.disableInfo)
+    assert(ok,'Disable failed: '..tostring(err))
+  else localStop(s) end
+  if running then
+    for _,v in ipairs(s.meta.restore or s.meta.sites or {}) do
+      local original=bytes(v.original)
+      assert(equal(read(s,s.base+v.rva,#original),original),
+        string.format('Original bytes were NOT restored at BH6.exe+%X / 原始指令尚未恢复',v.rva))
+    end
+    for _,v in ipairs(s.meta.release or {}) do
+      local original=bytes(v.original)
+      assert(equal(read(s,s.base+v.rva,#original),original),'A companion camera patch was not restored')
+    end
+  end
+  s.enabled=false
+  if s.record then pcall(function()
+    local function reset(record,children)
+      if children then for i=record.Count-1,0,-1 do reset(record.Child[i],true) end end
+      record.disableWithoutExecute()
+    end
+    reset(s.record,s.key=='1545' or s.key=='241')
+  end) end
+  if s.lock then
+    if s.ownsLock then api('kernel32.ReleaseMutex',s.lock) end
+    api('kernel32.CloseHandle',s.lock)
+  end
+  if s.handle then api('kernel32.CloseHandle',s.handle) end
+  if s.buffer then s.buffer.destroy() end
+  if s.scratch then s.scratch.destroy() end
+  s.handle=nil;s.closed=true
+  if M.states[s.key]==s then M.states[s.key]=nil end
+end
+function M.enable(key,record,script,meta)
+  local old=M.states[key]
+  if old then
+    if M.current(old) and old.enabled then error('This feature is already active in this CE session / 此功能已在当前 CE 中启用') end
+    M.stop(old)
+  end
+  local s={key=key,record=record,script=script,meta=meta or {}}
+  M.serial=M.serial+1;s.serial=M.serial;M.states[key]=s
+  local ok,err=xpcall(function()
+    s.pid=getOpenedProcessID();s.base=getAddressSafe('BH6.exe')
+    assert(s.pid and s.pid&gt;0 and s.base,'Attach BH6.exe first / 请先连接 BH6.exe')
+    s.handle=must(api('kernel32.OpenProcess',0x100c38,0,s.pid),'OpenProcess')
+    s.buffer=createMemoryStream();s.buffer.Size=0x2000
+    s.scratch=createMemoryStream();s.scratch.Size=0x1000
+    local header=read(s,s.base,0x1000);local pe=u32(header,0x3c)
+    assert(pe&gt;=64 and pe+0x54&lt;#header and u32(header,pe)==0x4550 and u32(header,pe+8)==0x51960399
+      and u32(header,pe+0x50)==0x14a1000,'Unsupported BH6.exe build')
+    local p=s.scratch.Memory
+    must(api('kernel32.GetProcessTimes',s.handle,p,p+8,p+16,p+24),'GetProcessTimes')
+    local lockKey=(key=='21915' or key=='21919') and 'game_over' or key
+    for _,other in pairs(M.states) do
+      assert(other==s or other.lockKey~=lockKey or not M.alive(other),
+        'An overlapping option is already active / 修改同一地址的另一个选项已启用')
+    end
+    s.lockKey=lockKey
+    local name=string.format('Local\\RE6_CT_%s_%d_%08X%08X',lockKey,s.pid,readIntegerLocal(p+4),readIntegerLocal(p))
+    s.lock=must(executeCodeLocalEx(getAddress('kernel32.CreateMutexW',true),
+      {type=0,value=0},{type=0,value=0},{type=4,value=name}),'CreateMutexW')
+    local acquired=api('kernel32.WaitForSingleObject',s.lock,0)
+    assert(acquired==0 or acquired==0x80,'Another CE owns this feature / 另一份 CE 正在控制此功能')
+    s.ownsLock=true
+    M.recover(s,s.meta.sites)
+    -- Only this entry's old names can survive a CE process retarget.
+    for _,name in ipairs(s.meta.symbols or {}) do unregisterSymbol(name) end
+    for _,name in ipairs(s.meta.staleSymbols or {}) do unregisterSymbol(name) end
+    if key=='1545' or key=='21848' then _G.fc_loop_running=false end
+    local assembled,info=autoAssemble(script)
+    assert(assembled,tostring(info));s.disableInfo=info;s.enabled=true
+    s.installed={}
+    for _,v in ipairs(s.meta.sites or {}) do
+      local address=s.base+v.rva
+      s.installed[#s.installed+1]={address=address,data=read(s,address,#bytes(v.original))}
+    end
+    s.symbols={}
+    for _,name in ipairs(s.meta.symbols or {}) do s.symbols[name]=getAddressSafe(name) end
+  end,debug.traceback)
+  if not ok then
+    if not s.critical and not s.suspended then pcall(M.stop,s) end
+    error(err)
+  end
+end
+function M.disable(key,meta)
+  local s=M.states[key]
+  if s and meta then s.meta=meta end
+  M.stop(s)
+end
+function M.stopAll()
+  local list={};for _,s in pairs(M.states) do list[#list+1]=s end
+  table.sort(list,function(a,b)return a.serial&gt;b.serial end)
+  local errors={}
+  for _,s in ipairs(list) do local ok,why=pcall(M.stop,s);if not ok then errors[#errors+1]=tostring(why) end end
+  return #errors==0,table.concat(errors,'\n')
+end
+M.timer=createTimer(nil,false);M.timer.Interval=250
+M.timer.OnTimer=function()
+  local stale={}
+  for _,s in pairs(M.states) do
+    local ok,current=pcall(M.current,s)
+    if (s.enabled or s.suspended or s.critical) and ok and not current then stale[#stale+1]=s end
+  end
+  table.sort(stale,function(a,b)return a.serial&gt;b.serial end)
+  for _,s in ipairs(stale) do
+    local ok,err=pcall(M.stop,s)
+    if not ok and not s.reported then s.reported=true;print('[RE6 lifecycle] '..tostring(err)) end
+  end
+end
+M.timer.Enabled=true
+local form=getMainForm();local previous=form.OnCloseQuery
+form.OnCloseQuery=function(sender)
+  if previous and previous(sender)==false then return false end
+  local ok,err=M.stopAll()
+  if not ok then showMessage('Unable to restore one of this table\'s patches / 有补丁未能恢复：\n'..err);return false end
+  return true
+end
+_G.RE6TableLifecycle20260915=M
+return M
+end)()
+{$asm}
+[ENABLE]
+{$lua}
+if syntaxcheck then return end
+-- Encoded payload prevents CE's outer AA parser from interpreting nested section directives.
+local source=('5b454e41424c455d0a616f627363616e6d6f64756c6528677074365f6d697373696e675f66696c65732c4248362e6578652c3842203443203234203038203831204543203030203034203030203030290a61737365727428677074365f6d697373696e675f66696c65732c3842203443203234203038290a726567697374657273796d626f6c28677074365f6d697373696e675f66696c6573290a677074365f6d697373696e675f66696c65733a0a202064622043332039302039302039300a5b44495341424c455d0a61737365727428677074365f6d697373696e675f66696c65732c4333203930203930203930290a677074365f6d697373696e675f66696c65733a0a202064622038422034432032342030380a756e726567697374657273796d626f6c28677074365f6d697373696e675f66696c6573290a'):gsub('..',function(b)return string.char(tonumber(b,16))end)
+_G.RE6TableLifecycle20260915.enable('63001',memrec or getAddressList().getMemoryRecordByID(63001),source,{["sites"]={{["rva"]=11384288,["original"]="8b4c2408",["patched"]="c3909090",["context"]="81ec000400008d84"}},["symbols"]={"gpt6_missing_files"}})
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+local lifecycle=_G.RE6TableLifecycle20260915
+if lifecycle then lifecycle.disable('63001',{["sites"]={{["rva"]=11384288,["original"]="8b4c2408",["patched"]="c3909090",["context"]="81ec000400008d84"}},["symbols"]={"gpt6_missing_files"}}) end
+{$asm}
+</AssemblerScript>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>63002</ID>
+          <Description>"Render Everything"</Description>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>{$lua}
+if syntaxcheck then return end
+local lifecycle=(function()
+-- Shared by the three standalone tables; bootstrapped by each entry.
+local previous=_G.RE6TableLifecycle20260915
+if previous and previous.revision==5 then return previous end
+local M=previous or {states={},serial=0}
+if M.timer then M.timer.Enabled=false;M.timer.destroy() end
+M.revision=5
+local function api(name,...)
+  local args={...}
+  for i,v in ipairs(args) do args[i]={type=0,value=v} end
+  return executeCodeLocalEx(getAddress(name,true),table.unpack(args))
+end
+local function must(v,name) assert(v and v~=0,name..' failed');return v end
+local function bytes(hex)
+  local out={};for v in hex:gmatch('%x%x') do out[#out+1]=tonumber(v,16) end;return out
+end
+local function equal(a,b)
+  if not a or #a~=#b then return false end
+  for i,v in ipairs(b) do if a[i]~=v then return false end end;return true
+end
+local function u32(t,i)
+  i=(i or 0)+1;return t[i]|t[i+1]&lt;&lt;8|t[i+2]&lt;&lt;16|t[i+3]&lt;&lt;24
+end
+local function packed(v)
+  return {v&amp;255,(v&gt;&gt;8)&amp;255,(v&gt;&gt;16)&amp;255,(v&gt;&gt;24)&amp;255}
+end
+local function join(...)
+  local out={};for _,a in ipairs({...}) do for _,b in ipairs(a) do out[#out+1]=b end end;return out
+end
+function M.alive(s)
+  if not s.handle then return false end
+  local wait=api('kernel32.WaitForSingleObject',s.handle,0)
+  assert(wait==0 or wait==258,'Cannot query the original game lifetime');return wait==258
+end
+function M.current(s)
+  return M.alive(s) and s.pid==getOpenedProcessID() and getAddressSafe('BH6.exe')==s.base
+end
+local function read(s,address,n)
+  must(api('kernel32.ReadProcessMemory',s.handle,address,s.buffer.Memory,n,s.scratch.Memory),'ReadProcessMemory')
+  assert(readQwordLocal(s.scratch.Memory)==n,'Partial memory read')
+  s.buffer.Position=0;return s.buffer.read(n)
+end
+local function write(s,address,data)
+  s.buffer.Position=0;s.buffer.write(data)
+  must(api('kernel32.WriteProcessMemory',s.handle,address,s.buffer.Memory,#data,s.scratch.Memory),'WriteProcessMemory')
+  assert(readQwordLocal(s.scratch.Memory)==#data and equal(read(s,address,#data),data),'Patch readback mismatch')
+  must(api('kernel32.FlushInstructionCache',s.handle,address,#data),'FlushInstructionCache')
+end
+local function protect(s,address,n,value)
+  must(api('kernel32.VirtualProtectEx',s.handle,address,n,value,s.scratch.Memory),'VirtualProtectEx')
+  return readIntegerLocal(s.scratch.Memory)
+end
+local function busy(s,changes)
+  local snap=api('kernel32.CreateToolhelp32Snapshot',4,0)
+  assert(snap and snap~=0 and snap~=-1,'Thread snapshot failed')
+  local result=false
+  local ok,err=pcall(function()
+    local p=s.scratch.Memory+0x100;writeIntegerLocal(p,28)
+    local more=must(api('kernel32.Thread32First',snap,p),'Thread32First')
+    local count=0
+    while more~=0 do
+      if readIntegerLocal(p+12)==s.pid then
+        local h=must(api('kernel32.OpenThread',0x48,0,readIntegerLocal(p+8)),'OpenThread')
+        local ctx=s.scratch.Memory+0x200;writeIntegerLocal(ctx,0x10001)
+        local got=api('kernel32.Wow64GetThreadContext',h,ctx)
+        local ip=readIntegerLocal(ctx+184);api('kernel32.CloseHandle',h)
+        must(got,'Wow64GetThreadContext');count=count+1
+        for _,v in ipairs(changes) do if ip&gt;=v.address and ip&lt;v.address+#v.old then result=true end end
+      end
+      writeIntegerLocal(p,28);more=api('kernel32.Thread32Next',snap,p)
+    end
+    assert(count&gt;0,'No game threads found')
+  end)
+  api('kernel32.CloseHandle',snap);assert(ok,err);return result
+end
+-- Only entry-point writes require a short, verified transaction. Caves are retained.
+function M.change(s,changes)
+  if #changes==0 then return end
+  assert(M.alive(s),'The original game process exited')
+  for attempt=1,30 do
+    local status=api('ntdll.NtSuspendProcess',s.handle)
+    assert(status and (status&amp;0x80000000)==0,'NtSuspendProcess failed')
+    s.suspended=true
+    local retry=false;local attempted={};local protections={}
+    local ok,err=xpcall(function()
+      retry=busy(s,changes);if retry then return end
+      for _,v in ipairs(changes) do assert(equal(read(s,v.address,#v.old),v.old),'Patch changed during recovery') end
+      for _,v in ipairs(changes) do
+        protections[#protections+1]={v.address,#v.old,protect(s,v.address,#v.old,0x40)}
+        attempted[#attempted+1]=v;write(s,v.address,v.new)
+      end
+    end,debug.traceback)
+    if not ok then
+      for i=#attempted,1,-1 do
+        local v=attempted[i]
+        if not pcall(write,s,v.address,v.old) then s.critical=true end
+      end
+    end
+    for i=#protections,1,-1 do
+      local p=protections[i];local restored,why=pcall(protect,s,p[1],p[2],p[3])
+      if not restored then ok=false;err=tostring(err)..'\n'..tostring(why) end
+    end
+    if s.critical then error('Patch rollback failed; controller retained for recovery') end
+    local resumed=api('ntdll.NtResumeProcess',s.handle)
+    assert(resumed and (resumed&amp;0x80000000)==0,'NtResumeProcess failed; controller retained')
+    s.suspended=false
+    assert(ok,err)
+    if not retry then return end
+    sleep(5)
+  end
+  error('Game thread is inside the patch; retry enabling this entry')
+end
+local function jump(s,address,opcode)
+  local t=read(s,address,5);assert(t[1]==opcode,'Unknown hook opcode')
+  return (address+5+u32(t,1))&amp;0xffffffff
+end
+local function checkKeepBlood(s,site,code)
+  local function expect(p,hex)
+    local b=bytes(hex);assert(equal(read(s,p,#b),b),'Unknown Game Over hook');return p+#b
+  end
+  local function branch(p,short,near)
+    local b=read(s,p,6)
+    if b[1]==short then return p+2+((b[2]&gt;=128) and b[2]-256 or b[2]),p+2 end
+    assert(b[1]==0x0f and b[2]==near,'Unknown Game Over condition')
+    return (p+6+u32(b,2))&amp;0xffffffff,p+6
+  end
+  local function jmp(p)
+    local b=read(s,p,5)
+    if b[1]==0xeb then return p+2+((b[2]&gt;=128) and b[2]-256 or b[2]) end
+    return jump(s,p,0xe9)
+  end
+  local p=expect(code,'83 F9 01');local skip
+  skip,p=branch(p,0x75,0x85)
+  assert(equal(read(s,p,6),join(bytes('81 3E'),packed(s.base+0x1190f40))),'Unknown Game Over type gate');p=p+6
+  local skip2;skip2,p=branch(p,0x74,0x84);assert(skip2==skip,'Unknown Game Over target')
+  p=expect(p,'8B 16 83 E0 FA')
+  local ret=jmp(p)
+  assert(jmp(skip)==site+0x59 and jmp(ret)==site+7,'Unknown Game Over return')
+end
+function M.recover(s,spec)
+  local changes={}
+  for _,v in ipairs(spec or {}) do
+    local address=s.base+v.rva;local original=bytes(v.original)
+    local current=read(s,address,#original)
+    if v.context then assert(equal(read(s,address+#original,#bytes(v.context)),bytes(v.context)),'Unsupported patch context') end
+    if not equal(current,original) then
+      if v.kind=='camera' then
+        local code=jump(s,address,0xe9)
+        assert(equal(read(s,code,14),join(bytes('89 0D'),packed(code-4),original))
+          and jump(s,code+14,0xe9)==address+8,'Unknown camera hook; no takeover attempted')
+        local padding={current[6],current[7],current[8]}
+        assert(equal(padding,{0x90,0x90,0x90}) or equal(padding,{0x0f,0x1f,0x00}),'Unknown camera padding')
+      elseif v.kind=='input' then
+        local code=jump(s,address,0xe9)
+        assert(equal(read(s,code-6,6),original) and equal(read(s,code,27),
+          join(bytes('83 A6 AC 02 00 00 00 83 A6 B0 02 00 00 00 83 A6 B4 02 00 00 00'),original))
+          and jump(s,code+27,0xe9)==address+6 and current[6]==0x90,'Unknown controller input hook')
+      elseif v.kind=='blood' then
+        assert(current[6]==0x90 and current[7]==0x90,'Unknown Game Over patch')
+        checkKeepBlood(s,address,jump(s,address,0xe9))
+      else assert(equal(current,bytes(v.patched)),'Foreign patch detected; memory was left unchanged') end
+      changes[#changes+1]={address=address,old=current,new=original}
+    end
+  end
+  -- Validate every site before restoring any of them.
+  M.change(s,changes)
+end
+local function localStop(s)
+  for _,name in ipairs(s.meta.timers or {}) do
+    local t=_G[name];if t then t.Enabled=false;t.destroy();_G[name]=nil end
+  end
+  if s.key=='21848' then _G.fc_loop_running=false end
+  for name,address in pairs(s.symbols or {}) do
+    if getAddressSafe(name)==address then unregisterSymbol(name) end
+  end
+end
+function M.stop(s)
+  if not s or s.closed then return end
+  local running=M.alive(s)
+  if not running then s.critical=false;s.suspended=false end
+  assert(not s.critical and not s.suspended,'Unresolved patch transaction; controller retained')
+  if s.key=='1545' or s.key=='241' or s.key=='21848' then
+    for _,key in ipairs({'21848','21913','21912','241'}) do
+      if key~=s.key and (key~='241' or s.key=='1545') and M.states[key] then M.stop(M.states[key]) end
+    end
+  end
+  -- An old CE may have left companion hooks that are not checked in this new table.
+  if running and s.meta.release then M.recover(s,s.meta.release) end
+  if s.enabled and running and #(s.meta.sites or {})&gt;0 then
+    local changes={}
+    for i,v in ipairs(s.meta.sites) do
+      local address=s.base+v.rva;local original=bytes(v.original)
+      local current=read(s,address,#original)
+      if not equal(current,original) then
+        assert(s.installed[i] and equal(current,s.installed[i].data),
+          'The active patch was changed by another controller; refusing to overwrite it')
+        changes[#changes+1]={address=address,old=current,new=original}
+      end
+    end
+    -- Restore through the original handle even if CE is now viewing another process.
+    M.change(s,changes)
+    localStop(s)
+    if s.key=='9002' then extra_respawn_patch_site=nil end
+  elseif s.enabled and (M.current(s) or s.meta.ownedHandle) then
+    local ok,err=autoAssemble(s.script,s.disableInfo)
+    assert(ok,'Disable failed: '..tostring(err))
+  else localStop(s) end
+  if running then
+    for _,v in ipairs(s.meta.restore or s.meta.sites or {}) do
+      local original=bytes(v.original)
+      assert(equal(read(s,s.base+v.rva,#original),original),
+        string.format('Original bytes were NOT restored at BH6.exe+%X / 原始指令尚未恢复',v.rva))
+    end
+    for _,v in ipairs(s.meta.release or {}) do
+      local original=bytes(v.original)
+      assert(equal(read(s,s.base+v.rva,#original),original),'A companion camera patch was not restored')
+    end
+  end
+  s.enabled=false
+  if s.record then pcall(function()
+    local function reset(record,children)
+      if children then for i=record.Count-1,0,-1 do reset(record.Child[i],true) end end
+      record.disableWithoutExecute()
+    end
+    reset(s.record,s.key=='1545' or s.key=='241')
+  end) end
+  if s.lock then
+    if s.ownsLock then api('kernel32.ReleaseMutex',s.lock) end
+    api('kernel32.CloseHandle',s.lock)
+  end
+  if s.handle then api('kernel32.CloseHandle',s.handle) end
+  if s.buffer then s.buffer.destroy() end
+  if s.scratch then s.scratch.destroy() end
+  s.handle=nil;s.closed=true
+  if M.states[s.key]==s then M.states[s.key]=nil end
+end
+function M.enable(key,record,script,meta)
+  local old=M.states[key]
+  if old then
+    if M.current(old) and old.enabled then error('This feature is already active in this CE session / 此功能已在当前 CE 中启用') end
+    M.stop(old)
+  end
+  local s={key=key,record=record,script=script,meta=meta or {}}
+  M.serial=M.serial+1;s.serial=M.serial;M.states[key]=s
+  local ok,err=xpcall(function()
+    s.pid=getOpenedProcessID();s.base=getAddressSafe('BH6.exe')
+    assert(s.pid and s.pid&gt;0 and s.base,'Attach BH6.exe first / 请先连接 BH6.exe')
+    s.handle=must(api('kernel32.OpenProcess',0x100c38,0,s.pid),'OpenProcess')
+    s.buffer=createMemoryStream();s.buffer.Size=0x2000
+    s.scratch=createMemoryStream();s.scratch.Size=0x1000
+    local header=read(s,s.base,0x1000);local pe=u32(header,0x3c)
+    assert(pe&gt;=64 and pe+0x54&lt;#header and u32(header,pe)==0x4550 and u32(header,pe+8)==0x51960399
+      and u32(header,pe+0x50)==0x14a1000,'Unsupported BH6.exe build')
+    local p=s.scratch.Memory
+    must(api('kernel32.GetProcessTimes',s.handle,p,p+8,p+16,p+24),'GetProcessTimes')
+    local lockKey=(key=='21915' or key=='21919') and 'game_over' or key
+    for _,other in pairs(M.states) do
+      assert(other==s or other.lockKey~=lockKey or not M.alive(other),
+        'An overlapping option is already active / 修改同一地址的另一个选项已启用')
+    end
+    s.lockKey=lockKey
+    local name=string.format('Local\\RE6_CT_%s_%d_%08X%08X',lockKey,s.pid,readIntegerLocal(p+4),readIntegerLocal(p))
+    s.lock=must(executeCodeLocalEx(getAddress('kernel32.CreateMutexW',true),
+      {type=0,value=0},{type=0,value=0},{type=4,value=name}),'CreateMutexW')
+    local acquired=api('kernel32.WaitForSingleObject',s.lock,0)
+    assert(acquired==0 or acquired==0x80,'Another CE owns this feature / 另一份 CE 正在控制此功能')
+    s.ownsLock=true
+    M.recover(s,s.meta.sites)
+    -- Only this entry's old names can survive a CE process retarget.
+    for _,name in ipairs(s.meta.symbols or {}) do unregisterSymbol(name) end
+    for _,name in ipairs(s.meta.staleSymbols or {}) do unregisterSymbol(name) end
+    if key=='1545' or key=='21848' then _G.fc_loop_running=false end
+    local assembled,info=autoAssemble(script)
+    assert(assembled,tostring(info));s.disableInfo=info;s.enabled=true
+    s.installed={}
+    for _,v in ipairs(s.meta.sites or {}) do
+      local address=s.base+v.rva
+      s.installed[#s.installed+1]={address=address,data=read(s,address,#bytes(v.original))}
+    end
+    s.symbols={}
+    for _,name in ipairs(s.meta.symbols or {}) do s.symbols[name]=getAddressSafe(name) end
+  end,debug.traceback)
+  if not ok then
+    if not s.critical and not s.suspended then pcall(M.stop,s) end
+    error(err)
+  end
+end
+function M.disable(key,meta)
+  local s=M.states[key]
+  if s and meta then s.meta=meta end
+  M.stop(s)
+end
+function M.stopAll()
+  local list={};for _,s in pairs(M.states) do list[#list+1]=s end
+  table.sort(list,function(a,b)return a.serial&gt;b.serial end)
+  local errors={}
+  for _,s in ipairs(list) do local ok,why=pcall(M.stop,s);if not ok then errors[#errors+1]=tostring(why) end end
+  return #errors==0,table.concat(errors,'\n')
+end
+M.timer=createTimer(nil,false);M.timer.Interval=250
+M.timer.OnTimer=function()
+  local stale={}
+  for _,s in pairs(M.states) do
+    local ok,current=pcall(M.current,s)
+    if (s.enabled or s.suspended or s.critical) and ok and not current then stale[#stale+1]=s end
+  end
+  table.sort(stale,function(a,b)return a.serial&gt;b.serial end)
+  for _,s in ipairs(stale) do
+    local ok,err=pcall(M.stop,s)
+    if not ok and not s.reported then s.reported=true;print('[RE6 lifecycle] '..tostring(err)) end
+  end
+end
+M.timer.Enabled=true
+local form=getMainForm();local previous=form.OnCloseQuery
+form.OnCloseQuery=function(sender)
+  if previous and previous(sender)==false then return false end
+  local ok,err=M.stopAll()
+  if not ok then showMessage('Unable to restore one of this table\'s patches / 有补丁未能恢复：\n'..err);return false end
+  return true
+end
+_G.RE6TableLifecycle20260915=M
+return M
+end)()
+{$asm}
+[ENABLE]
+{$lua}
+if syntaxcheck then return end
+-- Encoded payload prevents CE's outer AA parser from interpreting nested section directives.
+local source=('5b454e41424c455d0a616f627363616e6d6f64756c6528677074365f72656e6465725f65766572797468696e672c4248362e6578652c3735203138203842203044204243203438203836203031203830204239203731203031203030203030203030290a61737365727428677074365f72656e6465725f65766572797468696e672c3735203138290a726567697374657273796d626f6c28677074365f72656e6465725f65766572797468696e67290a677074365f72656e6465725f65766572797468696e673a0a202064622045420a5b44495341424c455d0a61737365727428677074365f72656e6465725f65766572797468696e672c4542203138290a677074365f72656e6465725f65766572797468696e673a0a202064622037350a756e726567697374657273796d626f6c28677074365f72656e6465725f65766572797468696e67290a'):gsub('..',function(b)return string.char(tonumber(b,16))end)
+_G.RE6TableLifecycle20260915.enable('63002',memrec or getAddressList().getMemoryRecordByID(63002),source,{["sites"]={{["rva"]=12468820,["original"]="75",["patched"]="eb",["context"]="188b0dbc48860180"}},["symbols"]={"gpt6_render_everything"}})
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+local lifecycle=_G.RE6TableLifecycle20260915
+if lifecycle then lifecycle.disable('63002',{["sites"]={{["rva"]=12468820,["original"]="75",["patched"]="eb",["context"]="188b0dbc48860180"}},["symbols"]={"gpt6_render_everything"}}) end
+{$asm}
+</AssemblerScript>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>63003</ID>
+          <Description>"Auto-Fix Textures [Unfinished - Unusable now]"</Description>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>{$lua}
+if syntaxcheck then return end
+local lifecycle=(function()
+-- Shared by the three standalone tables; bootstrapped by each entry.
+local previous=_G.RE6TableLifecycle20260915
+if previous and previous.revision==5 then return previous end
+local M=previous or {states={},serial=0}
+if M.timer then M.timer.Enabled=false;M.timer.destroy() end
+M.revision=5
+local function api(name,...)
+  local args={...}
+  for i,v in ipairs(args) do args[i]={type=0,value=v} end
+  return executeCodeLocalEx(getAddress(name,true),table.unpack(args))
+end
+local function must(v,name) assert(v and v~=0,name..' failed');return v end
+local function bytes(hex)
+  local out={};for v in hex:gmatch('%x%x') do out[#out+1]=tonumber(v,16) end;return out
+end
+local function equal(a,b)
+  if not a or #a~=#b then return false end
+  for i,v in ipairs(b) do if a[i]~=v then return false end end;return true
+end
+local function u32(t,i)
+  i=(i or 0)+1;return t[i]|t[i+1]&lt;&lt;8|t[i+2]&lt;&lt;16|t[i+3]&lt;&lt;24
+end
+local function packed(v)
+  return {v&amp;255,(v&gt;&gt;8)&amp;255,(v&gt;&gt;16)&amp;255,(v&gt;&gt;24)&amp;255}
+end
+local function join(...)
+  local out={};for _,a in ipairs({...}) do for _,b in ipairs(a) do out[#out+1]=b end end;return out
+end
+function M.alive(s)
+  if not s.handle then return false end
+  local wait=api('kernel32.WaitForSingleObject',s.handle,0)
+  assert(wait==0 or wait==258,'Cannot query the original game lifetime');return wait==258
+end
+function M.current(s)
+  return M.alive(s) and s.pid==getOpenedProcessID() and getAddressSafe('BH6.exe')==s.base
+end
+local function read(s,address,n)
+  must(api('kernel32.ReadProcessMemory',s.handle,address,s.buffer.Memory,n,s.scratch.Memory),'ReadProcessMemory')
+  assert(readQwordLocal(s.scratch.Memory)==n,'Partial memory read')
+  s.buffer.Position=0;return s.buffer.read(n)
+end
+local function write(s,address,data)
+  s.buffer.Position=0;s.buffer.write(data)
+  must(api('kernel32.WriteProcessMemory',s.handle,address,s.buffer.Memory,#data,s.scratch.Memory),'WriteProcessMemory')
+  assert(readQwordLocal(s.scratch.Memory)==#data and equal(read(s,address,#data),data),'Patch readback mismatch')
+  must(api('kernel32.FlushInstructionCache',s.handle,address,#data),'FlushInstructionCache')
+end
+local function protect(s,address,n,value)
+  must(api('kernel32.VirtualProtectEx',s.handle,address,n,value,s.scratch.Memory),'VirtualProtectEx')
+  return readIntegerLocal(s.scratch.Memory)
+end
+local function busy(s,changes)
+  local snap=api('kernel32.CreateToolhelp32Snapshot',4,0)
+  assert(snap and snap~=0 and snap~=-1,'Thread snapshot failed')
+  local result=false
+  local ok,err=pcall(function()
+    local p=s.scratch.Memory+0x100;writeIntegerLocal(p,28)
+    local more=must(api('kernel32.Thread32First',snap,p),'Thread32First')
+    local count=0
+    while more~=0 do
+      if readIntegerLocal(p+12)==s.pid then
+        local h=must(api('kernel32.OpenThread',0x48,0,readIntegerLocal(p+8)),'OpenThread')
+        local ctx=s.scratch.Memory+0x200;writeIntegerLocal(ctx,0x10001)
+        local got=api('kernel32.Wow64GetThreadContext',h,ctx)
+        local ip=readIntegerLocal(ctx+184);api('kernel32.CloseHandle',h)
+        must(got,'Wow64GetThreadContext');count=count+1
+        for _,v in ipairs(changes) do if ip&gt;=v.address and ip&lt;v.address+#v.old then result=true end end
+      end
+      writeIntegerLocal(p,28);more=api('kernel32.Thread32Next',snap,p)
+    end
+    assert(count&gt;0,'No game threads found')
+  end)
+  api('kernel32.CloseHandle',snap);assert(ok,err);return result
+end
+-- Only entry-point writes require a short, verified transaction. Caves are retained.
+function M.change(s,changes)
+  if #changes==0 then return end
+  assert(M.alive(s),'The original game process exited')
+  for attempt=1,30 do
+    local status=api('ntdll.NtSuspendProcess',s.handle)
+    assert(status and (status&amp;0x80000000)==0,'NtSuspendProcess failed')
+    s.suspended=true
+    local retry=false;local attempted={};local protections={}
+    local ok,err=xpcall(function()
+      retry=busy(s,changes);if retry then return end
+      for _,v in ipairs(changes) do assert(equal(read(s,v.address,#v.old),v.old),'Patch changed during recovery') end
+      for _,v in ipairs(changes) do
+        protections[#protections+1]={v.address,#v.old,protect(s,v.address,#v.old,0x40)}
+        attempted[#attempted+1]=v;write(s,v.address,v.new)
+      end
+    end,debug.traceback)
+    if not ok then
+      for i=#attempted,1,-1 do
+        local v=attempted[i]
+        if not pcall(write,s,v.address,v.old) then s.critical=true end
+      end
+    end
+    for i=#protections,1,-1 do
+      local p=protections[i];local restored,why=pcall(protect,s,p[1],p[2],p[3])
+      if not restored then ok=false;err=tostring(err)..'\n'..tostring(why) end
+    end
+    if s.critical then error('Patch rollback failed; controller retained for recovery') end
+    local resumed=api('ntdll.NtResumeProcess',s.handle)
+    assert(resumed and (resumed&amp;0x80000000)==0,'NtResumeProcess failed; controller retained')
+    s.suspended=false
+    assert(ok,err)
+    if not retry then return end
+    sleep(5)
+  end
+  error('Game thread is inside the patch; retry enabling this entry')
+end
+local function jump(s,address,opcode)
+  local t=read(s,address,5);assert(t[1]==opcode,'Unknown hook opcode')
+  return (address+5+u32(t,1))&amp;0xffffffff
+end
+local function checkKeepBlood(s,site,code)
+  local function expect(p,hex)
+    local b=bytes(hex);assert(equal(read(s,p,#b),b),'Unknown Game Over hook');return p+#b
+  end
+  local function branch(p,short,near)
+    local b=read(s,p,6)
+    if b[1]==short then return p+2+((b[2]&gt;=128) and b[2]-256 or b[2]),p+2 end
+    assert(b[1]==0x0f and b[2]==near,'Unknown Game Over condition')
+    return (p+6+u32(b,2))&amp;0xffffffff,p+6
+  end
+  local function jmp(p)
+    local b=read(s,p,5)
+    if b[1]==0xeb then return p+2+((b[2]&gt;=128) and b[2]-256 or b[2]) end
+    return jump(s,p,0xe9)
+  end
+  local p=expect(code,'83 F9 01');local skip
+  skip,p=branch(p,0x75,0x85)
+  assert(equal(read(s,p,6),join(bytes('81 3E'),packed(s.base+0x1190f40))),'Unknown Game Over type gate');p=p+6
+  local skip2;skip2,p=branch(p,0x74,0x84);assert(skip2==skip,'Unknown Game Over target')
+  p=expect(p,'8B 16 83 E0 FA')
+  local ret=jmp(p)
+  assert(jmp(skip)==site+0x59 and jmp(ret)==site+7,'Unknown Game Over return')
+end
+function M.recover(s,spec)
+  local changes={}
+  for _,v in ipairs(spec or {}) do
+    local address=s.base+v.rva;local original=bytes(v.original)
+    local current=read(s,address,#original)
+    if v.context then assert(equal(read(s,address+#original,#bytes(v.context)),bytes(v.context)),'Unsupported patch context') end
+    if not equal(current,original) then
+      if v.kind=='camera' then
+        local code=jump(s,address,0xe9)
+        assert(equal(read(s,code,14),join(bytes('89 0D'),packed(code-4),original))
+          and jump(s,code+14,0xe9)==address+8,'Unknown camera hook; no takeover attempted')
+        local padding={current[6],current[7],current[8]}
+        assert(equal(padding,{0x90,0x90,0x90}) or equal(padding,{0x0f,0x1f,0x00}),'Unknown camera padding')
+      elseif v.kind=='input' then
+        local code=jump(s,address,0xe9)
+        assert(equal(read(s,code-6,6),original) and equal(read(s,code,27),
+          join(bytes('83 A6 AC 02 00 00 00 83 A6 B0 02 00 00 00 83 A6 B4 02 00 00 00'),original))
+          and jump(s,code+27,0xe9)==address+6 and current[6]==0x90,'Unknown controller input hook')
+      elseif v.kind=='blood' then
+        assert(current[6]==0x90 and current[7]==0x90,'Unknown Game Over patch')
+        checkKeepBlood(s,address,jump(s,address,0xe9))
+      else assert(equal(current,bytes(v.patched)),'Foreign patch detected; memory was left unchanged') end
+      changes[#changes+1]={address=address,old=current,new=original}
+    end
+  end
+  -- Validate every site before restoring any of them.
+  M.change(s,changes)
+end
+local function localStop(s)
+  for _,name in ipairs(s.meta.timers or {}) do
+    local t=_G[name];if t then t.Enabled=false;t.destroy();_G[name]=nil end
+  end
+  if s.key=='21848' then _G.fc_loop_running=false end
+  for name,address in pairs(s.symbols or {}) do
+    if getAddressSafe(name)==address then unregisterSymbol(name) end
+  end
+end
+function M.stop(s)
+  if not s or s.closed then return end
+  local running=M.alive(s)
+  if not running then s.critical=false;s.suspended=false end
+  assert(not s.critical and not s.suspended,'Unresolved patch transaction; controller retained')
+  if s.key=='1545' or s.key=='241' or s.key=='21848' then
+    for _,key in ipairs({'21848','21913','21912','241'}) do
+      if key~=s.key and (key~='241' or s.key=='1545') and M.states[key] then M.stop(M.states[key]) end
+    end
+  end
+  -- An old CE may have left companion hooks that are not checked in this new table.
+  if running and s.meta.release then M.recover(s,s.meta.release) end
+  if s.enabled and running and #(s.meta.sites or {})&gt;0 then
+    local changes={}
+    for i,v in ipairs(s.meta.sites) do
+      local address=s.base+v.rva;local original=bytes(v.original)
+      local current=read(s,address,#original)
+      if not equal(current,original) then
+        assert(s.installed[i] and equal(current,s.installed[i].data),
+          'The active patch was changed by another controller; refusing to overwrite it')
+        changes[#changes+1]={address=address,old=current,new=original}
+      end
+    end
+    -- Restore through the original handle even if CE is now viewing another process.
+    M.change(s,changes)
+    localStop(s)
+    if s.key=='9002' then extra_respawn_patch_site=nil end
+  elseif s.enabled and (M.current(s) or s.meta.ownedHandle) then
+    local ok,err=autoAssemble(s.script,s.disableInfo)
+    assert(ok,'Disable failed: '..tostring(err))
+  else localStop(s) end
+  if running then
+    for _,v in ipairs(s.meta.restore or s.meta.sites or {}) do
+      local original=bytes(v.original)
+      assert(equal(read(s,s.base+v.rva,#original),original),
+        string.format('Original bytes were NOT restored at BH6.exe+%X / 原始指令尚未恢复',v.rva))
+    end
+    for _,v in ipairs(s.meta.release or {}) do
+      local original=bytes(v.original)
+      assert(equal(read(s,s.base+v.rva,#original),original),'A companion camera patch was not restored')
+    end
+  end
+  s.enabled=false
+  if s.record then pcall(function()
+    local function reset(record,children)
+      if children then for i=record.Count-1,0,-1 do reset(record.Child[i],true) end end
+      record.disableWithoutExecute()
+    end
+    reset(s.record,s.key=='1545' or s.key=='241')
+  end) end
+  if s.lock then
+    if s.ownsLock then api('kernel32.ReleaseMutex',s.lock) end
+    api('kernel32.CloseHandle',s.lock)
+  end
+  if s.handle then api('kernel32.CloseHandle',s.handle) end
+  if s.buffer then s.buffer.destroy() end
+  if s.scratch then s.scratch.destroy() end
+  s.handle=nil;s.closed=true
+  if M.states[s.key]==s then M.states[s.key]=nil end
+end
+function M.enable(key,record,script,meta)
+  local old=M.states[key]
+  if old then
+    if M.current(old) and old.enabled then error('This feature is already active in this CE session / 此功能已在当前 CE 中启用') end
+    M.stop(old)
+  end
+  local s={key=key,record=record,script=script,meta=meta or {}}
+  M.serial=M.serial+1;s.serial=M.serial;M.states[key]=s
+  local ok,err=xpcall(function()
+    s.pid=getOpenedProcessID();s.base=getAddressSafe('BH6.exe')
+    assert(s.pid and s.pid&gt;0 and s.base,'Attach BH6.exe first / 请先连接 BH6.exe')
+    s.handle=must(api('kernel32.OpenProcess',0x100c38,0,s.pid),'OpenProcess')
+    s.buffer=createMemoryStream();s.buffer.Size=0x2000
+    s.scratch=createMemoryStream();s.scratch.Size=0x1000
+    local header=read(s,s.base,0x1000);local pe=u32(header,0x3c)
+    assert(pe&gt;=64 and pe+0x54&lt;#header and u32(header,pe)==0x4550 and u32(header,pe+8)==0x51960399
+      and u32(header,pe+0x50)==0x14a1000,'Unsupported BH6.exe build')
+    local p=s.scratch.Memory
+    must(api('kernel32.GetProcessTimes',s.handle,p,p+8,p+16,p+24),'GetProcessTimes')
+    local lockKey=(key=='21915' or key=='21919') and 'game_over' or key
+    for _,other in pairs(M.states) do
+      assert(other==s or other.lockKey~=lockKey or not M.alive(other),
+        'An overlapping option is already active / 修改同一地址的另一个选项已启用')
+    end
+    s.lockKey=lockKey
+    local name=string.format('Local\\RE6_CT_%s_%d_%08X%08X',lockKey,s.pid,readIntegerLocal(p+4),readIntegerLocal(p))
+    s.lock=must(executeCodeLocalEx(getAddress('kernel32.CreateMutexW',true),
+      {type=0,value=0},{type=0,value=0},{type=4,value=name}),'CreateMutexW')
+    local acquired=api('kernel32.WaitForSingleObject',s.lock,0)
+    assert(acquired==0 or acquired==0x80,'Another CE owns this feature / 另一份 CE 正在控制此功能')
+    s.ownsLock=true
+    M.recover(s,s.meta.sites)
+    -- Only this entry's old names can survive a CE process retarget.
+    for _,name in ipairs(s.meta.symbols or {}) do unregisterSymbol(name) end
+    for _,name in ipairs(s.meta.staleSymbols or {}) do unregisterSymbol(name) end
+    if key=='1545' or key=='21848' then _G.fc_loop_running=false end
+    local assembled,info=autoAssemble(script)
+    assert(assembled,tostring(info));s.disableInfo=info;s.enabled=true
+    s.installed={}
+    for _,v in ipairs(s.meta.sites or {}) do
+      local address=s.base+v.rva
+      s.installed[#s.installed+1]={address=address,data=read(s,address,#bytes(v.original))}
+    end
+    s.symbols={}
+    for _,name in ipairs(s.meta.symbols or {}) do s.symbols[name]=getAddressSafe(name) end
+  end,debug.traceback)
+  if not ok then
+    if not s.critical and not s.suspended then pcall(M.stop,s) end
+    error(err)
+  end
+end
+function M.disable(key,meta)
+  local s=M.states[key]
+  if s and meta then s.meta=meta end
+  M.stop(s)
+end
+function M.stopAll()
+  local list={};for _,s in pairs(M.states) do list[#list+1]=s end
+  table.sort(list,function(a,b)return a.serial&gt;b.serial end)
+  local errors={}
+  for _,s in ipairs(list) do local ok,why=pcall(M.stop,s);if not ok then errors[#errors+1]=tostring(why) end end
+  return #errors==0,table.concat(errors,'\n')
+end
+M.timer=createTimer(nil,false);M.timer.Interval=250
+M.timer.OnTimer=function()
+  local stale={}
+  for _,s in pairs(M.states) do
+    local ok,current=pcall(M.current,s)
+    if (s.enabled or s.suspended or s.critical) and ok and not current then stale[#stale+1]=s end
+  end
+  table.sort(stale,function(a,b)return a.serial&gt;b.serial end)
+  for _,s in ipairs(stale) do
+    local ok,err=pcall(M.stop,s)
+    if not ok and not s.reported then s.reported=true;print('[RE6 lifecycle] '..tostring(err)) end
+  end
+end
+M.timer.Enabled=true
+local form=getMainForm();local previous=form.OnCloseQuery
+form.OnCloseQuery=function(sender)
+  if previous and previous(sender)==false then return false end
+  local ok,err=M.stopAll()
+  if not ok then showMessage('Unable to restore one of this table\'s patches / 有补丁未能恢复：\n'..err);return false end
+  return true
+end
+_G.RE6TableLifecycle20260915=M
+return M
+end)()
+{$asm}
+[ENABLE]
+{$lua}
+if syntaxcheck then return end
+-- Encoded payload prevents CE's outer AA parser from interpreting nested section directives.
+local source=('7b20554e46494e49534845443a206578706572696d656e74616c20737461746520746f67676c65206f6e6c792e0a20205468697320646f6573206e6f7420696d706c656d656e742055547261696e6572277320636f6d706c657465204175746f2d46697820546578747572657320776f726b65722e0a20204368617261637465722f6f7574666974206d617070696e672c20706f696e746572207265706169722c20616e6420776f726b65722074696d696e6720617265206d697373696e672e0a20205468652074657874757265207265706169722065666665637420697320756e76657269666965642e207d0a5b454e41424c455d0a7b246c75617d0a69662073796e746178636865636b207468656e2072657475726e20656e640a696620677074365f746578747572655f74696d6572207468656e20677074365f746578747572655f74696d65722e64657374726f79282920656e640a677074365f746578747572655f74696d6572203d2063726561746554696d6572286e696c2c2066616c7365290a677074365f746578747572655f74696d65722e496e74657276616c203d203130300a677074365f746578747572655f6c617374203d207b7d0a677074365f746578747572655f74696d65722e4f6e54696d6572203d2066756e6374696f6e2874290a20206c6f63616c206f776e65723d5f472e5245365461626c654c6966656379636c6532303236303931352e7374617465735b273633303033275d0a20206966206e6f74206f776e6572206f72206e6f74205f472e5245365461626c654c6966656379636c6532303236303931352e63757272656e74286f776e657229207468656e2072657475726e20656e640a20206c6f63616c206f6b2c206d6772203d207063616c6c2872656164506f696e7465722c206765744164647265737328274248362e6578652b313343363436382729290a20206966206e6f74206f6b206f72206e6f74206d6772206f72206d6772203d3d2030207468656e2072657475726e20656e640a20206c6f63616c20636667203d2072656164506f696e746572286765744164647265737328274248362e6578652b313343353435342729290a20206966206e6f7420636667206f7220636667203d3d2030207468656e2072657475726e20656e640a2020666f7220736c6f743d302c3720646f0a202020206c6f63616c206f626a203d2072656164506f696e746572286d6772202b2030783234202b20736c6f742a34290a202020206966206f626a20616e64206f626a207e3d2030207468656e0a2020202020206c6f63616c206368203d2072656164427974657328636667202b2030783437443743202b20736c6f742a307837302c20312c2066616c736529206f7220300a2020202020206c6f63616c206f7574666974203d2072656164427974657328636667202b2030783437443744202b20736c6f742a307837302c20312c2066616c736529206f7220300a2020202020206c6f63616c206b6579203d206368202a20323536202b206f75746669740a202020202020696620677074365f746578747572655f6c6173745b736c6f745d207e3d206e696c20616e6420677074365f746578747572655f6c6173745b736c6f745d207e3d206b6579207468656e0a20202020202020202d2d2052652d656e74657220746865206e6f726d616c20706c61796572207265667265736820706174682e205468652064657363726970746f7220706f696e7465722069730a20202020202020202d2d206c65667420696e746163743b20746869732061766f69647320636f7272757074696e67206368617261637465722fe69c8de8a385206d6170206f776e6572736869702e0a20202020202020207772697465496e7465676572286f626a202b20307833382c2030290a20202020202020207772697465496e7465676572286f626a202b20307833382c203078323031290a202020202020656e640a202020202020677074365f746578747572655f6c6173745b736c6f745d203d206b65790a20202020656e640a2020656e640a656e640a677074365f746578747572655f74696d65722e456e61626c6564203d20747275650a7b2461736d7d0a5b44495341424c455d0a7b246c75617d0a69662073796e746178636865636b207468656e2072657475726e20656e640a696620677074365f746578747572655f74696d6572207468656e20677074365f746578747572655f74696d65722e64657374726f7928293b20677074365f746578747572655f74696d65723d6e696c20656e640a677074365f746578747572655f6c617374203d206e696c0a7b2461736d7d0a'):gsub('..',function(b)return string.char(tonumber(b,16))end)
+_G.RE6TableLifecycle20260915.enable('63003',memrec or getAddressList().getMemoryRecordByID(63003),source,{["timers"]={"gpt6_texture_timer"},["symbols"]={}})
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+local lifecycle=_G.RE6TableLifecycle20260915
+if lifecycle then lifecycle.disable('63003',{["timers"]={"gpt6_texture_timer"},["symbols"]={}}) end
+{$asm}
+</AssemblerScript>
+        </CheatEntry>
+      </CheatEntries>
+    </CheatEntry>
+  </CheatEntries>
+  <UserdefinedSymbols/>
+</CheatTable>
