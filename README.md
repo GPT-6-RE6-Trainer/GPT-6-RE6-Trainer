@@ -21,6 +21,8 @@ A Resident Evil 6 Python trainer. This preview brings related controls together 
 <details>
 <summary>中文</summary>
 
+### 使用前请先从 [Python 官网](https://www.python.org/downloads/) 下载并安装 Python
+
 
 部分修改功能的灵感来自 [Heebo](https://www.patreon.com/Heebo)，感谢其提供的启发。
 
